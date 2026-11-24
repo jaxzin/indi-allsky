@@ -386,17 +386,30 @@ def test_malformed_client_is_dropped(sock_path, closers, bad):
     assert good.recv(2.0) == ('json', {'kind': 'ok'})
 
 
-def test_stalled_client_dropped_at_json_cap(sock_path, closers):
-    server = make_server(sock_path, closers)
-    reader = make_client(sock_path, closers)
-    assert wait_for(lambda: len(server.clients()) == 1)
-    reader_id = server.clients()[0]
+def _drop_reasons(caplog, cid):
+    return [r.args[1] for r in caplog.records
+            if r.msg == 'Focus link client %d dropped: %s' and r.args and r.args[0] == cid]
 
+
+def _connect_stalled(sock_path, closers):
     stalled = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     closers.append(stalled)
     stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
     stalled.connect(sock_path)
     stalled.sendall(raw_message({'kind': 'hello'}))
+    return stalled
+
+
+def test_stalled_client_dropped_at_json_cap(sock_path, closers, monkeypatch, caplog):
+    # A send timeout far beyond the test's length, so only the JSON cap can drop anyone.
+    monkeypatch.setattr(link, 'SEND_TIMEOUT_S', 60.0)
+    caplog.set_level('INFO', logger='indi_allsky')
+    server = make_server(sock_path, closers)
+    reader = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    reader_id = server.clients()[0]
+
+    _connect_stalled(sock_path, closers)
     assert wait_for(lambda: len(server.clients()) == 2)
     stalled_id = [c for c in server.clients() if c != reader_id][0]
 
@@ -408,35 +421,40 @@ def test_stalled_client_dropped_at_json_cap(sock_path, closers):
     for i in range(3000):
         server.broadcast_json({'kind': 'tick', 'i': i, 'pad': pad})
         sent += 1
-        assert reader.recv(2.0) == ('json', {'kind': 'tick', 'i': i, 'pad': pad})
+        assert reader.recv(10.0) == ('json', {'kind': 'tick', 'i': i, 'pad': pad})
         if stalled_id not in server.clients():
             break
 
     assert server.clients() == [reader_id]
     assert sent > 256
+    assert _drop_reasons(caplog, stalled_id) == ['json queue full']
     server.broadcast_json({'kind': 'after'})
-    assert reader.recv(2.0) == ('json', {'kind': 'after'})
+    assert reader.recv(10.0) == ('json', {'kind': 'after'})
 
 
-def test_stalled_client_dropped_at_send_timeout(sock_path, closers, monkeypatch):
+def test_stalled_client_dropped_at_send_timeout(sock_path, closers, monkeypatch, caplog):
     # Frames never overflow the slot, so the send timeout is a frame-only page's guard.
-    monkeypatch.setattr(link, 'SEND_TIMEOUT_S', 0.3)  # read at accept time
+    # SEND_TIMEOUT_S is applied to each connection when it registers (at hello), so the
+    # healthy reader keeps the real 5 s timeout and only the stalled page gets a short one.
+    caplog.set_level('INFO', logger='indi_allsky')
     server = make_server(sock_path, closers)
     reader = make_client(sock_path, closers)
     assert wait_for(lambda: len(server.clients()) == 1)
     reader_id = server.clients()[0]
 
-    stalled = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    closers.append(stalled)
-    stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
-    stalled.connect(sock_path)
-    stalled.sendall(raw_message({'kind': 'hello'}))
+    monkeypatch.setattr(link, 'SEND_TIMEOUT_S', 1.0)
+    _connect_stalled(sock_path, closers)
     assert wait_for(lambda: len(server.clients()) == 2)
+    monkeypatch.undo()
+    stalled_id = [c for c in server.clients() if c != reader_id][0]
 
-    frame = b'\x7f' * (8 * 1024 * 1024)
+    # 1 MiB is far more than the kernel buffers hold (about 200 KiB on Linux, 8 KiB on
+    # macOS), so the stalled page's send must block; it is still small for the reader.
+    frame = b'\x7f' * (1024 * 1024)
     server.broadcast_frame(frame)
-    assert reader.recv(3.0) == ('frame', frame)
-    assert wait_for(lambda: server.clients() == [reader_id], timeout=3.0)
+    assert reader.recv(10.0) == ('frame', frame)
+    assert wait_for(lambda: server.clients() == [reader_id], timeout=10.0)
+    assert _drop_reasons(caplog, stalled_id) == ['send timed out']
 
 
 def test_close_removes_socket_and_disconnects_clients(sock_path, closers):
