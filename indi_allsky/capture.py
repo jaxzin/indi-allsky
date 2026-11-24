@@ -2025,6 +2025,8 @@ class CaptureWorker(Process):
                 gain=lambda: max(0.0, float(getattr(self.indiclient, 'gain', 0) or 0)),
                 state_path=state_path,
                 reconfigure=self._focus_reconfigure,
+                exposure_max=float(self.config.get('CCD_EXPOSURE_MAX', 15.0)),
+                notify=self._focus_notify,
             )
         except Exception:
             logger.exception('Focus: the live focus service could not be set up')
@@ -2032,6 +2034,16 @@ class CaptureWorker(Process):
             return
 
         self.focus = glue.service
+
+
+    def _focus_notify(self, key, message):
+        """A camera setting the session could not put back (runs in the session pass's app context)."""
+        self._miscDb.addNotification(
+            NotificationCategory.CAMERA,
+            key,
+            message,
+            expire=timedelta(hours=24),
+        )
 
 
     def _focus_reconfigure(self):

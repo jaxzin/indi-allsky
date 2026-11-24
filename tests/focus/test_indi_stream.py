@@ -12,6 +12,7 @@ from indi_allsky.focus import indi_stream
 from indi_allsky.focus.indi_stream import NUMBERS
 from indi_allsky.focus.indi_stream import SWITCHES
 from indi_allsky.focus.indi_stream import IndiStreamSource
+from indi_allsky.focus.indi_stream import MissingProperty
 from indi_allsky.focus.indi_stream import focus_startup_restore
 from indi_allsky.focus.indi_stream import has_video
 from indi_allsky.focus.indi_stream import restore_state
@@ -125,6 +126,7 @@ def test_indi_stream_start_order():
     src.start((100, 50, 256, 128), 0.2, 150)
     assert client.taken() == [
         stream(False),
+        ('number', 'CCD_BINNING', {'HOR_BIN': 1, 'VER_BIN': 1}),
         ('number', 'CCD_FRAME', {'X': 100, 'Y': 50, 'WIDTH': 256, 'HEIGHT': 128}),
         ('number', 'CCD_STREAM_FRAME', {'X': 0, 'Y': 0, 'WIDTH': 256, 'HEIGHT': 128}),
         ('switch', 'CCD_STREAM_ENCODER', ('RAW',)),
@@ -229,7 +231,7 @@ def test_restore_puts_values_back_and_never_starts_the_stream():
     src.start((0, 0, 64, 64), 0.5, 400)
     src.stop()
     client.taken()
-    assert restore_state(client, state) == 0
+    assert restore_state(client, state) == []
     calls = client.taken()
     assert calls[0] == stream(False)
     assert stream(True) not in calls
@@ -247,7 +249,7 @@ def test_restore_goes_on_past_a_failing_property():
     state = save_state(client)
     state['numbers']['NOT_THERE'] = {'A': 1.0}
     del client.numbers['CCD_BINNING']
-    assert restore_state(client, state) == 1  # CCD_BINNING failed; NOT_THERE is not on the list
+    assert restore_state(client, state) == ['CCD_BINNING']  # NOT_THERE is not on the list
     names = [c[1] for c in client.taken()]
     assert 'CCD_CONTROLS' in names and 'NOT_THERE' not in names
 
@@ -424,3 +426,103 @@ def test_simulated_camera_streams_through_start_video():
     assert cam.video == [('stop',), ('start', 0.1, (0, 0, 32, 32)), ('stop',), ('start', 0.2, (0, 0, 32, 32)),
                          ('stop',)]
     assert cam.taken() == []  # no INDI properties
+
+
+# -- fix round 1 ------------------------------------------------------------------------------------------------------
+
+class BusyStreamClient(FakeClient):
+    """A driver that holds CCD_VIDEO_STREAM at BUSY while it streams: a set_switch that waits for OK never gets it."""
+
+    def __init__(self):
+        super(BusyStreamClient, self).__init__()
+        self.stream_syncs = []
+
+    def set_switch(self, device, name, on_switches=[], off_switches=[], sync=True, timeout=None):
+        super(BusyStreamClient, self).set_switch(device, name, on_switches, off_switches, sync, timeout)
+        if name == 'CCD_VIDEO_STREAM':
+            self.stream_syncs.append(sync)
+            if sync and 'STREAM_ON' in on_switches:
+                time.sleep(2.0)  # the property is BUSY, not OK
+                raise TimeoutError('Timeout error')
+
+
+def test_stream_on_does_not_wait_for_a_busy_property():
+    client = BusyStreamClient()
+    src = IndiStreamSource(client, sensor=SENSOR)
+    t0 = time.monotonic()
+    src.start((0, 0, 64, 64), 0.1, 0)
+    src.set_camera(0.2, 0)
+    assert time.monotonic() - t0 < 0.5
+    assert client.stream_syncs and not any(client.stream_syncs)
+    src.stop()
+
+
+def test_binned_camera_streams_at_1x1_and_gets_its_binning_back():
+    client = FakeClient()
+    client.numbers['CCD_BINNING'] = {'HOR_BIN': (2.0, 1, 4), 'VER_BIN': (2.0, 1, 4)}
+    state = save_state(client)
+    src = IndiStreamSource(client, sensor=SENSOR)
+    src.start((0, 0, 64, 64), 0.1, 0)
+    calls = client.taken()
+    assert calls[:2] == [stream(False), ('number', 'CCD_BINNING', {'HOR_BIN': 1, 'VER_BIN': 1})]
+    src.stop()
+    assert restore_state(client, state) == []
+    assert client.numbers['CCD_BINNING']['HOR_BIN'][0] == 2.0
+    assert client.numbers['CCD_BINNING']['VER_BIN'][0] == 2.0
+
+
+def test_wrong_size_blobs_are_reported_once(caplog):
+    client = FakeClient()
+    src = IndiStreamSource(client, sensor=SENSOR)
+    src.start((0, 0, 64, 64), 0.1, 0)
+    with caplog.at_level('WARNING', logger='indi_allsky'):
+        for _ in range(3):
+            client.blob_sink(u16(np.zeros((32, 32))), '.stream', 1.0)  # a 2x2-binned frame of the region
+    warnings = [r for r in caplog.records if 'not a 64x64 frame' in r.getMessage()]
+    assert len(warnings) == 1 and warnings[0].levelname == 'WARNING'
+    assert src.frames.empty()
+    src.stop()
+
+
+@pytest.mark.parametrize('missing, video', [
+    ('CCD_FRAME', False), ('CCD_FRAME', True), ('STREAMING_EXPOSURE', True),
+    ('CCD_VIDEO_STREAM', True), ('CCD_STREAM_ENCODER', True),
+])
+def test_save_state_refuses_without_a_required_property(missing, video):
+    client = FakeClient()
+    client.numbers.pop(missing, None)
+    client.switches.pop(missing, None)
+    with pytest.raises(MissingProperty) as e:
+        save_state(client, video=video)
+    assert e.value.name == missing
+    assert client.taken() == []
+
+
+def test_save_state_for_stills_needs_no_stream_property():
+    client = FakeClient()
+    for name in ('CCD_VIDEO_STREAM', 'CCD_STREAM_ENCODER'):
+        del client.switches[name]
+    del client.numbers['STREAMING_EXPOSURE']
+    assert 'CCD_FRAME' in save_state(client, video=False)['numbers']
+
+
+def test_frames_in_flight_during_a_restart_are_dropped_not_relabelled():
+    class Racing(FakeClient):
+        """An old-settings frame arrives while the stream restarts."""
+        src = None
+
+        def set_number(self, device, name, values, sync=True, timeout=None):
+            super(Racing, self).set_number(device, name, values, sync, timeout)
+            if name == 'STREAMING_EXPOSURE' and self.src is not None:
+                self.blob_sink(u16(np.full((64, 64), 5)), '.stream', 9.0)
+
+    client = Racing()
+    src = IndiStreamSource(client, sensor=SENSOR)
+    src.start((0, 0, 64, 64), 0.1, 10)
+    client.src = src
+    src.set_camera(0.5, 20)
+    assert src.frames.empty()  # exposed at 0.1 s: it must not come out labelled 0.5 s
+    client.blob_sink(u16(np.full((64, 64), 5)), '.stream', 10.0)
+    frame = src.frames.get(timeout=1)
+    assert (frame.exposure, frame.gain) == (0.5, 20.0)
+    src.stop()

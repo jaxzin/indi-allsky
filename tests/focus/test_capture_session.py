@@ -13,6 +13,7 @@ from indi_allsky import constants
 from indi_allsky.focus.capture_session import FocusGlue
 from indi_allsky.focus.capture_session import open_link
 from indi_allsky.focus.capture_session import state_path_for
+from indi_allsky.focus.controller import MSG_MISSING_PROPERTY
 from indi_allsky.focus.controller import focus_sleep
 from indi_allsky.focus.controller import focus_wait_turn
 from indi_allsky.focus.controller import run_session_pass
@@ -67,12 +68,15 @@ def rig(sock_path, closers):
     closers.append(link)
     camera = Camera()
     reconfigured = []
+    notices = []
     glue = FocusGlue(
         camera, link,
         camera_interface='test_rotating_stars', device_name='Rotating Stars Test Camera',
         ccd_info=CCD_INFO, cfa=None, gain=lambda: 7.0,
         state_path=state_path_for(sock_path),
         reconfigure=lambda: reconfigured.append(True),
+        exposure_max=5.0,
+        notify=lambda key, message: notices.append((key, message)),
     )
     worker = SimpleNamespace(focus=glue.service, _shutdown=False, _miscDb=FakeMiscDb())
 
@@ -85,7 +89,7 @@ def rig(sock_path, closers):
         return Page(client)
 
     return SimpleNamespace(link=link, camera=camera, glue=glue, worker=worker, page=page,
-                           reconfigured=reconfigured, state_path=state_path_for(sock_path))
+                           reconfigured=reconfigured, notices=notices, state_path=state_path_for(sock_path))
 
 
 def start_session(r):
@@ -194,8 +198,12 @@ def test_a_failing_poll_ends_the_session_not_capture(rig):
 
 
 def test_failed_start_still_leaves_the_wait_and_cleans_up(rig):
-    def broken(*args, **kwargs):
-        raise RuntimeError('no camera')
+    real = rig.camera.set_number
+
+    def broken(device, name, values, sync=True, timeout=None):
+        if name == 'CCD_STREAM_FRAME':  # optional to restore, so the state file goes
+            raise RuntimeError('no camera')
+        return real(device, name, values, sync, timeout)
 
     rig.camera.set_number = broken  # the stream cannot start
     page = rig.page()
@@ -384,3 +392,133 @@ def test_test_camera_streams_frames(fake_pyindi):
     blurred = np.frombuffer(got[0][0], dtype='<u2').reshape(32, 32)
     assert blurred.max() < raw.max()
     assert (blurred > 1000).sum() > (raw > 1000).sum()
+
+
+# -- fix round 1 ------------------------------------------------------------------------------------------------------
+
+def test_ceiling_is_the_configured_exposure_max_not_the_drivers(rig):
+    start_session(rig)  # the driver allows 3600 s; the config says 5 s
+    assert rig.worker.focus.controller._search.ceiling == 5.0
+    rig.worker.focus.stop('done')
+
+
+def test_driver_without_a_required_property_refuses_and_leaves_the_camera_alone(rig):
+    del rig.camera.numbers['STREAMING_EXPOSURE']
+    page = rig.page()
+    page.client.send({'kind': 'start'})
+    err = page.json('error', pump=lambda: run_session_pass(rig.worker))
+    assert err['command'] == 'start'
+    assert err['message'] == MSG_MISSING_PROPERTY.format('STREAMING_EXPOSURE')
+    assert rig.camera.aborts == 0 and rig.camera.exposing
+    assert rig.camera.taken() == []
+    assert rig.camera.blob_sink is None
+    assert not os.path.exists(rig.state_path)
+    assert not rig.worker.focus.active
+    assert focus_wait_turn(rig.worker) is False  # capture keeps waiting for its exposure
+
+
+def test_a_required_property_not_restored_keeps_the_file_and_notifies(rig):
+    start_session(rig)
+    real = rig.camera.set_number
+
+    def failing(device, name, values, sync=True, timeout=None):
+        if name == 'STREAMING_EXPOSURE':
+            raise TimeoutError(name)
+        return real(device, name, values, sync, timeout)
+
+    rig.camera.set_number = failing
+    rig.worker.focus.stop('done')
+    assert os.path.exists(rig.state_path)  # the next capture start tries again
+    assert [k for k, _ in rig.notices] == ['focus_restore']
+    assert 'STREAMING_EXPOSURE' in rig.notices[0][1]
+    assert rig.camera.blob_sink is None
+    assert rig.reconfigured == [True]
+
+
+def test_an_optional_property_not_restored_deletes_the_file_quietly(rig):
+    start_session(rig)
+    real = rig.camera.set_number
+
+    def failing(device, name, values, sync=True, timeout=None):
+        if name == 'LIMITS':
+            raise TimeoutError(name)
+        return real(device, name, values, sync, timeout)
+
+    rig.camera.set_number = failing
+    rig.worker.focus.stop('done')
+    assert not os.path.exists(rig.state_path)
+    assert rig.notices == []
+
+
+def test_end_always_clears_the_blob_sink(rig):
+    start_session(rig)
+    rig.camera.blob_sink = lambda *a: None  # not the source's own: its stop leaves it
+    rig.camera.disconnected = True  # on_end returns early
+    rig.worker.focus.stop('stopped')
+    assert rig.camera.blob_sink is None
+
+
+def test_a_failing_end_still_puts_the_camera_back(rig):
+    start_session(rig)
+    controller = rig.worker.focus.controller
+
+    def broken(reason):
+        raise RuntimeError('bug')
+
+    controller.end = broken
+    rig.worker.focus.stop('stopped')
+    assert not rig.worker.focus.active and rig.worker.focus.controller is None
+    assert rig.worker.focus.idle_reason == 'stopped'
+    assert rig.reconfigured == [True]
+    controller._stop.set()  # end() never ran: stop its worker here
+    controller.source.stop()
+
+
+def test_failure_logs_name_the_error_type_not_its_message(rig, caplog):
+    start_session(rig)
+
+    def broken():
+        raise RuntimeError('words a page sent')
+
+    rig.worker.focus.controller.service = broken
+    with caplog.at_level('DEBUG', logger='indi_allsky'):
+        assert run_session_pass(rig.worker) is True
+    assert 'Focus: the session failed (RuntimeError)' in caplog.text
+    assert 'words a page sent' not in caplog.text
+    assert not any(r.exc_info for r in caplog.records)
+
+
+def test_a_failing_setup_logs_the_error_type_only(rig, caplog):
+    def broken(*args, **kwargs):
+        raise ValueError('words a page sent')
+
+    rig.glue.service._make = broken
+    page = rig.page()
+    page.client.send({'kind': 'start'})
+    with caplog.at_level('DEBUG', logger='indi_allsky'):
+        err = page.json('error', pump=lambda: run_session_pass(rig.worker))
+    assert err['command'] == 'start'
+    assert 'Focus: the session could not be set up (ValueError)' in caplog.text
+    assert 'words a page sent' not in caplog.text
+
+
+def test_a_second_session_keeps_the_settings_the_first_could_not_put_back(rig):
+    rig.camera.numbers['STREAMING_EXPOSURE']['STREAMING_EXPOSURE_VALUE'] = (2.0, 0.000032, 3600)
+    start_session(rig)
+    real = rig.camera.set_number
+
+    def failing(device, name, values, sync=True, timeout=None):
+        if name == 'STREAMING_EXPOSURE':
+            raise TimeoutError(name)
+        return real(device, name, values, sync, timeout)
+
+    rig.camera.set_number = failing
+    rig.worker.focus.stop('done')
+    assert os.path.exists(rig.state_path)
+    rig.camera.set_number = real  # the driver answers again
+    assert rig.camera.numbers['STREAMING_EXPOSURE']['STREAMING_EXPOSURE_VALUE'][0] != 2.0
+
+    start_session(rig)  # the camera still holds the first session's exposure
+    rig.worker.focus.stop('done')
+    assert rig.camera.numbers['STREAMING_EXPOSURE']['STREAMING_EXPOSURE_VALUE'][0] == 2.0  # the original value
+    assert not os.path.exists(rig.state_path)

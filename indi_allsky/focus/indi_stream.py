@@ -40,6 +40,10 @@ SWITCHES = ('STREAM_FULL_DEPTH', 'CCD_STREAM_ENCODER', 'CCD_VIDEO_FORMAT', 'CCD_
 RESTORE_SWITCHES = ('STREAM_FULL_DEPTH', 'CCD_STREAM_ENCODER', 'CCD_VIDEO_FORMAT', 'CCD_CAPTURE_FORMAT')
 RESTORE_NUMBERS = ('CCD_BINNING', 'CCD_FRAME', 'CCD_STREAM_FRAME', 'STREAMING_EXPOSURE', 'LIMITS', 'CCD_CONTROLS')
 
+# a session does not start without these: it could not put the camera back (or stream at all) without them
+REQUIRED = ('CCD_FRAME',)
+REQUIRED_VIDEO = ('CCD_VIDEO_STREAM', 'CCD_STREAM_ENCODER', 'STREAMING_EXPOSURE')
+
 CONTROL_TIMEOUT_S = 1.0       # finding a property; get_control waits forever on 0
 SET_TIMEOUT_S = 5.0           # a property change to settle
 WHOLE_FRAME_TIMEOUT_S = 30.0
@@ -91,38 +95,50 @@ def has_video(client) -> bool:
 
 # -- camera state ---------------------------------------------------------------------------------------------------
 
-def save_state(client) -> dict:
+class MissingProperty(Exception):
+    """The driver lacks (or did not answer for) a property a session needs. `name` is the property."""
+
+    def __init__(self, name: str):
+        super(MissingProperty, self).__init__(name)
+        self.name = name
+
+
+def required_properties(video: bool) -> tuple:
+    return REQUIRED + (REQUIRED_VIDEO if video else ())
+
+
+def save_state(client, *, video: bool = True) -> dict:
     """{'numbers': {property: {element: value}}, 'switches': {property: [elements on]}} for the properties the
-    stream changes. A property the driver does not have is left out."""
+    stream changes. An optional property the driver does not have is left out; a required one (`REQUIRED`, and
+    `REQUIRED_VIDEO` for video) raises MissingProperty. Saving only reads, so a refusal leaves the camera as it was."""
+    required = required_properties(video)
     state = {'numbers': {}, 'switches': {}}
-    for name in NUMBERS:
-        try:
-            state['numbers'][name] = _numbers(client, name)
-        except Exception:
-            logger.info('Focus: the camera has no %s to save', name)
-    for name in SWITCHES:
-        try:
-            state['switches'][name] = _switch_on(client, name)
-        except Exception:
-            logger.info('Focus: the camera has no %s to save', name)
+    for kind, names, read in (('numbers', NUMBERS, _numbers), ('switches', SWITCHES, _switch_on)):
+        for name in names:
+            try:
+                state[kind][name] = read(client, name)
+            except Exception:
+                if name in required:
+                    logger.error('Focus: the camera has no %s; a focus session cannot start', name)
+                    raise MissingProperty(name)
+                logger.info('Focus: the camera has no %s to save', name)
     return state
 
 
-def restore_state(client, state: dict) -> int:
-    """Put the saved values back, the stream off whatever was saved. Returns the number of properties that failed;
-    each failure is logged and the rest are still restored."""
+def restore_state(client, state: dict) -> list:
+    """Put the saved values back, the stream off whatever was saved. Returns the properties that failed; each
+    failure is logged and the rest are still restored."""
     device = _device(client)
-    failures = 0
+    failures = []
     numbers = state.get('numbers') or {}
     switches = state.get('switches') or {}
 
     def attempt(what, fn, *args, **kwargs):
-        nonlocal failures
         try:
             fn(*args, **kwargs)
         except Exception as e:
-            failures += 1
-            logger.error('Focus: could not restore %s: %s', what, e)
+            failures.append(what)
+            logger.error('Focus: could not restore %s (%s)', what, type(e).__name__)
 
     if 'CCD_VIDEO_STREAM' in switches:
         attempt('CCD_VIDEO_STREAM', client.set_switch, device, 'CCD_VIDEO_STREAM', on_switches=['STREAM_OFF'])
@@ -145,6 +161,19 @@ def write_state(path: str, state: dict) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+def read_state(path: str) -> Optional[dict]:
+    """The state a session left in the file, or None when there is none or it cannot be read."""
+    try:
+        with open(path) as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        logger.error('Focus: the saved camera state could not be read (%s)', type(e).__name__)
+        return None
+    return state if isinstance(state, dict) else None
 
 
 def remove_state(path: str) -> None:
@@ -173,7 +202,7 @@ def focus_startup_restore(camera, path: str) -> bool:
         logger.warning('Focus: a focus session did not end cleanly; restoring the camera')
         failures = restore_state(camera, state)
         if failures:
-            logger.error('Focus: %d camera properties could not be restored', failures)
+            logger.error('Focus: %d camera properties could not be restored', len(failures))
         return True
     except Exception:
         logger.exception('Focus: restoring the camera at startup failed')
@@ -211,6 +240,7 @@ class IndiStreamSource(object):
         self._whole = None
         self._fps_max = None
         self._present = {}                # optional property -> whether the driver has it
+        self._size_warned = False         # a blob of the wrong size is reported once per session
 
     # -- PictureSource -----------------------------------------------------------------------------------------------
 
@@ -222,23 +252,31 @@ class IndiStreamSource(object):
             self._exposure = float(exposure)
             self._gain = float(gain)
             self._running = True
+            self._size_warned = False
         self.client.blob_sink = self._on_blob
         self._configure(region)
 
     def set_camera(self, exposure, gain):
-        with self._cond:
-            self._exposure = float(exposure)
-            self._gain = float(gain)
-            running = self._running
-        if not running:
-            return
+        """Restart the stream with new settings. While it restarts no frame is taken: one still on its way was
+        exposed with the old settings and would carry the new label."""
         with self._ctl:
-            if self._simulated:
-                self._restart_simulated()
-                return
-            self._stream(False)
-            self._set_rate()
-            self._stream(True)
+            with self._cond:
+                self._exposure = float(exposure)
+                self._gain = float(gain)
+                if not self._running:
+                    return
+                streaming, self._streaming = self._streaming, None
+            try:
+                if self._simulated:
+                    self._restart_simulated(streaming)
+                else:
+                    self._stream(False)
+                    self._set_rate()
+                    self._stream(True)
+            finally:
+                with self._cond:
+                    if self._streaming is None:
+                        self._streaming = streaming
 
     def whole_frame(self, timeout=WHOLE_FRAME_TIMEOUT_S):
         """One full-sensor frame: stream the whole sensor until one arrives, then the region again."""
@@ -296,10 +334,13 @@ class IndiStreamSource(object):
                     return
             if self._simulated:
                 self._set_streaming(region)
-                self._restart_simulated()
+                self._restart_simulated(tuple(region))
                 return
             client, device = self.client, _device(self.client)
             self._stream(False)
+            if self._has('CCD_BINNING', 'number'):
+                # the stream's blobs are binned too: at 2x2 every one would be a quarter of the region's size
+                client.set_number(device, 'CCD_BINNING', {'HOR_BIN': 1, 'VER_BIN': 1}, timeout=SET_TIMEOUT_S)
             self._set_streaming(region)
             x, y, w, h = region
             client.set_number(device, 'CCD_FRAME', {'X': x, 'Y': y, 'WIDTH': w, 'HEIGHT': h}, timeout=SET_TIMEOUT_S)
@@ -334,12 +375,14 @@ class IndiStreamSource(object):
         return self._present[name]
 
     def _stream(self, on):
+        # sync=False: the driver keeps CCD_VIDEO_STREAM at BUSY for as long as it streams, so a wait for OK would
+        # time out on every start (focus_spike.py set_switch sends and never waits)
         self.client.set_switch(_device(self.client), 'CCD_VIDEO_STREAM',
-                               on_switches=['STREAM_ON' if on else 'STREAM_OFF'])
+                               on_switches=['STREAM_ON' if on else 'STREAM_OFF'], sync=False)
 
-    def _restart_simulated(self):
+    def _restart_simulated(self, region):
         with self._cond:
-            exposure, region = self._exposure, self._streaming
+            exposure = self._exposure
         self.client.stop_video()
         self.client.start_video(exposure, region)
 
@@ -381,7 +424,11 @@ class IndiStreamSource(object):
             whole = self._whole_waiting and region[2:] == self._sensor_size_even()
         raw, full_scale = decode_stream(data, region[2], region[3], fmt)
         if raw is None:
-            logger.debug('Focus: a blob that is not a frame of the stream was dropped')
+            with self._cond:
+                warn, self._size_warned = not self._size_warned, True
+            if warn:
+                logger.warning('Focus: the camera sends pictures of %d bytes, which is not a %dx%d frame; they are '
+                               'dropped (is the camera binned?)', len(data), region[2], region[3])
             return
         mosaic = raw.dtype == np.uint16 or len(data) == region[2] * region[3]  # not a debayered or JPEG frame
         if raw.dtype == np.uint16:

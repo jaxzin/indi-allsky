@@ -148,6 +148,8 @@ MSG_PREVIEW_FAILED = 'Could not take a whole-sensor picture.'
 MSG_PREVIEW_BUSY = 'A whole-sensor picture is already on its way.'
 MSG_SATURATED = 'The picked stars are saturated. Try a shorter exposure.'
 MSG_START_FAILED = 'The focus session could not start.'
+MSG_MISSING_PROPERTY = ('The camera driver has no {0}, which a focus session needs. '
+                        'The session did not start and the camera was not changed.')
 
 SESSION_TURN_S = 0.05         # capture's loop sleep while a session runs, and per wait-loop turn
 STATUS_EVERY_S = 1.0          # WATCHDOG and STATUS writes during a session, at most this often
@@ -165,6 +167,11 @@ class CameraInfo:
 
 class _Invalid(Exception):
     """A command value out of range; the argument names it for MSG_INVALID."""
+
+
+class StartRefused(Exception):
+    """Raised by a controller factory before it touches the camera. Its message is page copy: the page shows it,
+    and capture's exposure goes on."""
 
 
 def _rig_dict(rig) -> dict:
@@ -343,6 +350,14 @@ class FocusController(object):
             if pending.is_alive():
                 logger.error('Focus: the whole-sensor picture did not stop')
         self.link.broadcast_json({'kind': 'ended', 'reason': reason})
+
+    def abandon(self, reason: str) -> None:
+        """After `end` itself failed: count the session as over, so the service still puts the camera back."""
+        with self._lock:
+            self._ended = True
+            self._active = False
+            if self.end_reason is None:
+                self.end_reason = reason
 
     def service(self) -> None:
         """Page arrivals, the session rules, and the worker's requests. Call it often from the owning thread."""
@@ -972,11 +987,16 @@ class FocusService(object):
                     # refused before the camera is touched: capture's exposure goes on
                     self._error(cid, kind, (rig.reason if rig is not None else '') or MSG_START_FAILED)
                     continue
-                self._start_attempted = True  # making the controller aborts the exposure in progress
+                attempted, self._start_attempted = self._start_attempted, True  # making it aborts the exposure
                 try:
                     controller = self._make(cid)
-                except Exception:
-                    logger.exception('Focus: the session could not be set up')
+                except StartRefused as e:
+                    self._start_attempted = attempted  # refused before the camera was touched
+                    self._error(cid, kind, str(e) or MSG_START_FAILED)
+                    continue
+                except Exception as e:
+                    # spec §12: the type only; a message could carry what a client sent
+                    logger.error('Focus: the session could not be set up (%s)', type(e).__name__)
                     self._error(cid, kind, MSG_START_FAILED)
                     continue
                 self.controller = controller
@@ -1008,9 +1028,9 @@ class FocusService(object):
         if controller is not None:
             try:
                 controller.end(reason)
-            except Exception:
-                logger.exception('Focus: ending the session failed')
-                controller._active = False
+            except Exception as e:
+                logger.error('Focus: ending the session failed (%s)', type(e).__name__)
+                controller.abandon(reason)
         self._reap()
 
     def _reap(self):
@@ -1054,12 +1074,13 @@ def _safe_poll(service) -> None:
     """A focus failure ends the session; it never reaches the capture loop."""
     try:
         service.poll()
-    except Exception:
-        logger.exception('Focus: the session failed')
+    except Exception as e:
+        # spec §12: the type only; a message could carry what a client sent
+        logger.error('Focus: the session failed (%s)', type(e).__name__)
         try:
             service.stop('failed')
-        except Exception:
-            logger.exception('Focus: ending the failed session failed')
+        except Exception as e2:
+            logger.error('Focus: ending the failed session failed (%s)', type(e2).__name__)
 
 
 def run_session_pass(worker, *, sleep: Callable[[float], None] = time.sleep,

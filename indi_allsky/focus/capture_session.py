@@ -1,11 +1,13 @@
 """What the capture worker builds for a focus session: the link, the service, and the camera steps around a session.
 
 `FocusGlue` holds the camera and turns a page's `start` into a `FocusController`:
-  1. abort the exposure in progress (it is discarded);
-  2. save the camera state next to the link's socket (video only: stills change no camera property);
+  1. read the camera state (video only: stills change no stream property); a driver without a required property
+     refuses the start here, before the camera is touched;
+  2. abort the exposure in progress (it is discarded) and write the state next to the link's socket;
   3. build the picture source for the rig and the controller.
 When the session ends, `on_end` stops nothing itself (the controller already stopped the source), restores the saved
-state, deletes the file and asks capture to reconfigure the camera for its normal schedule.
+state, deletes the file (kept when a required property failed, for the next startup), clears the client's blob sink
+and asks capture to reconfigure the camera for its normal schedule.
 
 No import of PyIndi, Flask or capture: tests drive this with fake cameras.
 """
@@ -22,10 +24,16 @@ from indi_allsky.focus import rigs
 from indi_allsky.focus.controller import CameraInfo
 from indi_allsky.focus.controller import FocusController
 from indi_allsky.focus.controller import FocusService
+from indi_allsky.focus.controller import MSG_MISSING_PROPERTY
+from indi_allsky.focus.controller import StartRefused
 from indi_allsky.focus.exposure_search import ExposureSearch
 from indi_allsky.focus.exposure_search import default_ceiling
 from indi_allsky.focus.indi_stream import IndiStreamSource
+from indi_allsky.focus.indi_stream import MissingProperty
+from indi_allsky.focus.indi_stream import REQUIRED
+from indi_allsky.focus.indi_stream import REQUIRED_VIDEO
 from indi_allsky.focus.indi_stream import has_video
+from indi_allsky.focus.indi_stream import read_state
 from indi_allsky.focus.indi_stream import remove_state
 from indi_allsky.focus.indi_stream import restore_state
 from indi_allsky.focus.indi_stream import save_state
@@ -44,6 +52,9 @@ STATE_SUFFIX = '.state.json'
 VIDEO_START_EXPOSURE_S = 0.1
 SHORTEST_FLOOR_S = 1e-6      # a driver that reports a minimum exposure of 0 or less
 VIDEO_REGION_PX = 1024       # the first region: a centred square, at most this size
+RESTORE_NOTICE_KEY = 'focus_restore'
+MSG_RESTORE_FAILED = ('The focus session could not put back the camera setting {0}. indi-allsky tries again when '
+                      'capture restarts; until then pictures may come out wrong.')
 
 
 def state_path_for(address: str) -> str:
@@ -89,7 +100,12 @@ class FocusGlue(object):
 
     def __init__(self, camera, link, *, camera_interface: str, device_name: str, ccd_info: dict, cfa,
                  gain: Callable[[], float], state_path: str, reconfigure: Callable[[], None],
+                 exposure_max: Optional[float] = None,
+                 notify: Optional[Callable[[str, str], None]] = None,
                  epoch: Callable[[], float] = time.time):
+        """exposure_max: config CCD_EXPOSURE_MAX, the longest exposure the session may pick (at most 15 s).
+        notify(key, message): raises an indi-allsky notification; called when a required camera property could not
+        be put back."""
         self.camera = camera
         self.link = link
         self.ccd_info = ccd_info or {}
@@ -97,6 +113,8 @@ class FocusGlue(object):
         self.state_path = state_path
         self._gain = gain
         self._reconfigure = reconfigure
+        self._exposure_max = exposure_max
+        self._notify = notify
         self._epoch = epoch
         video = has_video(camera)
         rig = rigs.decide(camera_interface, device_name, video, link_ok=True)
@@ -111,20 +129,33 @@ class FocusGlue(object):
         if rig.picture not in ('video', 'stills'):
             raise RuntimeError('this camera cannot run a focus session')
 
+        self._saved = None
+        simulated = callable(getattr(self.camera, 'start_video', None))
+        saved = None
+        if rig.picture == 'video' and not simulated:
+            try:
+                saved = save_state(self.camera, video=True)  # reads only: a refusal leaves the camera as it was
+            except MissingProperty as e:
+                raise StartRefused(MSG_MISSING_PROPERTY.format(e.name))
+            left = read_state(self.state_path)
+            if left is not None:
+                # an earlier session could not put a required property back: the camera holds the session's
+                # values, so the file, not the camera, has the settings to return to
+                logger.warning('Focus: keeping the camera settings an earlier session could not put back')
+                saved = left
+
         self.camera.abortCcdExposure()  # the normal exposure in progress is discarded
 
         shortest = _ccd(self.ccd_info, 'CCD_EXPOSURE', 'CCD_EXPOSURE_VALUE', 'min')
         if shortest is None or shortest <= 0:
             shortest = SHORTEST_FLOOR_S
-        ceiling = default_ceiling(_ccd(self.ccd_info, 'CCD_EXPOSURE', 'CCD_EXPOSURE_VALUE', 'max'))
+        ceiling = default_ceiling(self._exposure_max)  # the config's longest exposure, not the driver's
         ceiling = max(ceiling, shortest)
 
-        self._saved = None
         try:
             if rig.picture == 'video':
-                simulated = callable(getattr(self.camera, 'start_video', None))
-                if not simulated:
-                    self._saved = save_state(self.camera)
+                if saved is not None:
+                    self._saved = saved
                     write_state(self.state_path, self._saved)
                 width = _ccd(self.ccd_info, 'CCD_FRAME', 'WIDTH', 'max')
                 height = _ccd(self.ccd_info, 'CCD_FRAME', 'HEIGHT', 'max')
@@ -158,17 +189,35 @@ class FocusGlue(object):
 
     def on_end(self, controller: FocusController) -> None:
         """After the controller stopped the source: put the camera back for the normal schedule."""
-        if getattr(self.camera, 'disconnected', False) or getattr(self.camera, 'ccd_removed', False):
-            # the camera is gone: the state file stays, and capture restores it when it starts again
-            logger.warning('Focus: the camera is not connected; its settings are restored at the next start')
+        gone = getattr(self.camera, 'disconnected', False) or getattr(self.camera, 'ccd_removed', False)
+        try:
+            if gone:
+                # the state file stays, and capture restores it when it starts again
+                logger.warning('Focus: the camera is not connected; its settings are restored at the next start')
+                return
+            if self._saved is not None:
+                saved, self._saved = self._saved, None
+                failures = restore_state(self.camera, saved)
+                if failures:
+                    logger.error('Focus: %d camera properties could not be restored', len(failures))
+                required = [name for name in failures if name in REQUIRED + REQUIRED_VIDEO]
+                if required:
+                    # the state file stays: capture tries the restore again when it starts
+                    logger.error('Focus: a required camera property was not restored: %s', ', '.join(required))
+                    self._raise_notice(MSG_RESTORE_FAILED.format(', '.join(required)))
+                else:
+                    # an optional property that failed would only fail again at the next startup
+                    remove_state(self.state_path)
+        finally:
+            if getattr(self.camera, 'blob_sink', None) is not None:
+                self.camera.blob_sink = None  # capture's exposures go to the image queue again
+            if not gone:
+                self._reconfigure()
+
+    def _raise_notice(self, message: str) -> None:
+        if self._notify is None:
             return
         try:
-            if self._saved is not None:
-                failures = restore_state(self.camera, self._saved)
-                if failures:
-                    logger.error('Focus: %d camera properties could not be restored', failures)
-                # deleted even after a failure: a later startup would only repeat the same restore
-                remove_state(self.state_path)
-                self._saved = None
-        finally:
-            self._reconfigure()
+            self._notify(RESTORE_NOTICE_KEY, message)
+        except Exception as e:
+            logger.error('Focus: the notification could not be raised (%s)', type(e).__name__)
