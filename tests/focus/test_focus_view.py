@@ -117,27 +117,27 @@ def test_new_page_idle_shows_start_only_for_admin_network(page):
     status, html = page.get(remote_addr=ADMIN_IP, admin=True)
     assert status == 200
     assert 'data-focus-session' in html
-    assert 'data-can-start="1"' in html
+    assert 'id="focus-start"' in html
 
     status, html = page.get(remote_addr=OUTSIDE_IP, admin=True)
     assert 'data-focus-session' in html
-    assert 'data-can-start="0"' in html
+    assert 'id="focus-start"' not in html
 
     status, html = page.get(remote_addr=ADMIN_IP, admin=False)
-    assert 'data-can-start="0"' in html
+    assert 'id="focus-start"' not in html
 
 
-def test_new_page_passes_motor_and_ws_url(page):
+def test_new_page_renders_motor_controls_and_passes_the_ws_url(page):
     page.link_up()
     page.config['FOCUSER'] = {'CLASSNAME': 'focuser_x'}
 
     status, html = page.get()
-    assert 'data-motor="1"' in html
+    assert 'id="FOCUS_CCW"' in html
     assert 'data-ws-url="ws://localhost/indi-allsky/ws/focus"' in html
 
     page.config['FOCUSER'] = {}
     status, html = page.get()
-    assert 'data-motor="0"' in html
+    assert 'id="FOCUS_CCW"' not in html
 
 
 def test_idle_page_keeps_todays_picture_and_score(page):
@@ -206,4 +206,4 @@ def test_stills_rig_shows_the_reason(page):
     assert status == 200
     assert 'data-focus-session' in html
     assert 'live video is not available for this camera type' in html
-    assert 'id="fs-region-btn"' in html  # the crop moves on stills rigs too (spec 6.2)
+    # whether Move region is offered on a stills rig is the page's call: test_focus_page_js pins canMoveRegion

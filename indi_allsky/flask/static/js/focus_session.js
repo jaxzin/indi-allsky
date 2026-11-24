@@ -203,6 +203,11 @@
     // The gain slider: the camera's range when known (else 0 .. 600, or twice the current gain), with a fine step
     // when the range is small.
     function gainRange(min, max, current) {
+        if (known(min) && known(max) && min === max) {
+            // a fixed-gain camera: nothing to choose (capture sends null limits for a camera with no gain control,
+            // and the slider then falls back to the defaults below)
+            return {min: min, max: max, step: 1, fixed: true};
+        }
         var lo = known(min) ? min : 0;
         var hi = known(max) && max > lo ? max : Math.max(600, Math.ceil(current * 2), lo + 1);
         lo = Math.min(lo, current);
@@ -239,6 +244,12 @@
         return {x: x - x % 2, y: y - y % 2, w: size, h: size};
     }
 
+    // Move region is offered in both modes (spec 6.2): a stills rig starts with no region (whole frame) and can
+    // still choose one.
+    function canMoveRegion(mode) {
+        return !!mode && (mode.picture === 'video' || mode.picture === 'stills');
+    }
+
     var STAR_WORDS = {
         kept: 'measured', weak: 'too faint', dropped: 'left out', pinned: 'the only one measured',
         saturated: 'too bright'
@@ -253,7 +264,7 @@
         fmtAge: fmtAge, fmtExposure: fmtExposure, fmtGain: fmtGain, liveText: liveText,
         pendingAdd: pendingAdd, pendingShown: pendingShown, pendingDrop: pendingDrop, pendingRefused: pendingRefused,
         exposureChoices: exposureChoices, gainRange: gainRange, expectedGap: expectedGap, regionBox: regionBox,
-        starWord: starWord
+        starWord: starWord, canMoveRegion: canMoveRegion
     };
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = pure;
@@ -651,6 +662,10 @@
             setText($id('fs-exp-btn'), 'Exposure ' + fmtExposure(m.exposure) + ' ▾');
             setText($id('fs-gain-btn'), 'Gain ' + fmtGain(m.gain) + ' ▾');
         }
+        var regionBtn = $id('fs-region-btn');
+        if (regionBtn) {
+            show(regionBtn, canMoveRegion(m));
+        }
     }
 
     // ==== the number =============================================================================================
@@ -936,12 +951,14 @@
         g.max = gainSpan.max;
         g.step = gainSpan.step;
         g.value = gain;
+        g.disabled = !!gainSpan.fixed;  // a fixed-gain camera: the value shows, nothing to slide
+        g.title = gainSpan.fixed ? 'This camera has a fixed gain.' : '';
         camTouched = {exp: false, gain: false};
         showCamera();
     }
 
     function chosenGain() {
-        if (!camTouched.gain) {
+        if (!camTouched.gain || gainSpan.fixed) {
             return S.mode.gain;
         }
         var v = Number($id('fs-gain').value);
@@ -977,7 +994,7 @@
     }
 
     function openRegion() {
-        if (S.preview || !S.mode) {
+        if (S.preview || !canMoveRegion(S.mode)) {
             return;
         }
         if (!send({kind: 'preview'})) {

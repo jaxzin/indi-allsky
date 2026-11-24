@@ -151,6 +151,24 @@ def test_gain_range_from_the_camera_with_a_fine_step_for_small_ranges():
     assert got[2] == {'min': 0, 'max': 600, 'step': 1}
 
 
+def test_gain_range_for_a_fixed_gain_camera_is_fixed():
+    got = run('console.log(JSON.stringify([h.gainRange(1, 1, 1), h.gainRange(0, 0, 0), h.gainRange(0, 10, 2).fixed,'
+              ' h.gainRange(null, null, 0).fixed]));')
+
+    assert got[0] == {'min': 1, 'max': 1, 'step': 1, 'fixed': True}
+    assert got[1] == {'min': 0, 'max': 0, 'step': 1, 'fixed': True}
+    assert got[2:] == [None, None]
+
+
+def test_region_can_move_in_both_modes_even_without_a_region_yet():
+    got = run('console.log(JSON.stringify([h.canMoveRegion({picture: "stills", roi: null}),'
+              ' h.canMoveRegion({picture: "video", roi: [0, 0, 1024, 1024]}),'
+              ' h.canMoveRegion({picture: "video", roi: null}), h.canMoveRegion(null),'
+              ' h.canMoveRegion({picture: "classic", roi: null})]));')
+
+    assert got == [True, True, True, False, False]
+
+
 def test_fractional_gain_reads_sensibly():
     got = run('console.log(JSON.stringify([h.fmtGain(1.25), h.fmtGain(1.2), h.fmtGain(12.34)]));')
 

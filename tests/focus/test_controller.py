@@ -893,6 +893,14 @@ def test_set_camera_at_the_limits_is_taken(connect, make, source):
     assert ('set_camera', 5.0, 400.0) in source.calls
 
 
+def test_set_camera_with_no_gain_limits_takes_gain_zero(connect, make, source):
+    cid, page = connect()
+    ctrl = make(exposure=2.0, exposure_min=0.001, exposure_max=5.0, gain_min=None, gain_max=None)
+    ctrl.begin(cid)
+    ctrl.handle(cid, {'kind': 'set_camera', 'exposure': 1.0, 'gain': 0})
+    assert ('set_camera', 1.0, 0.0) in source.calls
+
+
 def test_errors_carry_the_command_id(session):
     ctrl, page = session
     ctrl.handle(page.cid, {'kind': 'set_region', 'roi': 'x', 'cmd_id': 12})

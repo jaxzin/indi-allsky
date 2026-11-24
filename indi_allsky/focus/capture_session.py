@@ -100,6 +100,16 @@ def _gain_info(ccd_info: dict, key: str) -> Optional[float]:
     return value if math.isfinite(value) else None
 
 
+def _gain_limits(ccd_info: dict):
+    """(min, max) of the camera's gain, or (None, None) when the range means nothing: indi.py reports min = max = -1
+    for a camera without gain control, and an upside-down range is no range. A fixed gain (min == max >= 0) stays."""
+    low = _gain_info(ccd_info, 'min')
+    high = _gain_info(ccd_info, 'max')
+    if low is None or high is None or high < 0 or high < low:
+        return None, None
+    return low, high
+
+
 def default_region(width: int, height: int):
     """A centred square of at most VIDEO_REGION_PX, on the Bayer grid."""
     size = min(VIDEO_REGION_PX, width, height)
@@ -183,6 +193,7 @@ class FocusGlue(object):
                 source = StillsSource(self.camera, self._swap_image_q)
                 roi = None
                 start = shortest
+            gain_min, gain_max = _gain_limits(self.ccd_info)
             return FocusController(
                 source, self.link, SessionClock(), rig, False,
                 epoch=self._epoch, exposure=start, gain=float(self._gain()), roi=roi,
@@ -190,8 +201,8 @@ class FocusGlue(object):
                 # the same sources capture checks its own settings against (capture.py: CCD_EXPOSURE, GAIN_INFO)
                 exposure_min=driver_shortest if driver_shortest is not None and driver_shortest > 0 else None,
                 exposure_max=ceiling,
-                gain_min=_gain_info(self.ccd_info, 'min'),
-                gain_max=_gain_info(self.ccd_info, 'max'),
+                gain_min=gain_min,
+                gain_max=gain_max,
             )
         except Exception:
             if self._saved is not None:

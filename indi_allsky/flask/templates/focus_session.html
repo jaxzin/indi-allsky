@@ -76,8 +76,6 @@
 {% block content %}
 <div id="focus-session" class="fs"
      data-focus-session
-     data-can-start="{{ 1 if can_start else 0 }}"
-     data-motor="{{ 1 if motor_configured else 0 }}"
      data-ws-url="{{ focus_ws_url }}"
      data-poll-url="{{ url_for('indi_allsky.js_focus_view') }}"
      data-motor-url="{{ url_for('indi_allsky.focus_controller_view') }}"

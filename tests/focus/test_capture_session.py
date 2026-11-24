@@ -419,6 +419,26 @@ def test_unknown_limits_are_none(rig):
     rig.worker.focus.stop('done')
 
 
+@pytest.mark.parametrize('gain_min, gain_max', [
+    (-1.0, -1.0),   # indi.py fake_gain_info: the camera has no gain control
+    (10.0, 5.0),    # an upside-down range
+])
+def test_a_sentinel_gain_range_is_unknown(rig, gain_min, gain_max):
+    rig.glue.ccd_info = dict(CCD_INFO, GAIN_INFO={'current': 0.0, 'min': gain_min, 'max': gain_max, 'step': 1.0})
+    start_session(rig)
+    limits = rig.worker.focus.controller.limits
+    assert (limits['gain_min'], limits['gain_max']) == (None, None)
+    rig.worker.focus.stop('done')
+
+
+def test_a_fixed_gain_keeps_its_limits(rig):
+    rig.glue.ccd_info = dict(CCD_INFO, GAIN_INFO={'current': 1.0, 'min': 1.0, 'max': 1.0, 'step': 1.0})
+    start_session(rig)
+    limits = rig.worker.focus.controller.limits
+    assert (limits['gain_min'], limits['gain_max']) == (1.0, 1.0)
+    rig.worker.focus.stop('done')
+
+
 def test_driver_without_a_required_property_refuses_and_leaves_the_camera_alone(rig):
     del rig.camera.numbers['STREAMING_EXPOSURE']
     page = rig.page()
