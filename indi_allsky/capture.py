@@ -2008,13 +2008,13 @@ class CaptureWorker(Process):
         address = app.config.get('INDI_ALLSKY_FOCUS_ADDRESS', FOCUS_DEFAULT_ADDRESS)
         state_path = focus_state_path_for(address)
 
-        focus_startup_restore(self.indiclient, state_path)
-
-        self.focus_link = focus_open_link(address)
-        if not self.focus_link:
-            return
+        focus_startup_restore(self.indiclient, state_path)  # never raises
 
         try:
+            self.focus_link = focus_open_link(address)
+            if not self.focus_link:
+                return
+
             glue = FocusGlue(
                 self.indiclient,
                 self.focus_link,

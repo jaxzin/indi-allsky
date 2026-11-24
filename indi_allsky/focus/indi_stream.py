@@ -44,6 +44,9 @@ CONTROL_TIMEOUT_S = 1.0       # finding a property; get_control waits forever on
 SET_TIMEOUT_S = 5.0           # a property change to settle
 WHOLE_FRAME_TIMEOUT_S = 30.0
 MAX_QUEUED = 4                # frames waiting for the controller; older ones are dropped
+# STREAM_FULL_DEPTH and CCD_CONTROLS are ZWO's and LIMITS is INDI's stream manager: each is set only when the driver
+# has it (`_has`). IndiClient.set_switch/set_number look a property up with the client's full timeout, so a missing
+# one is skipped after a short look instead.
 ISS_ON = 1
 
 
@@ -207,6 +210,7 @@ class IndiStreamSource(object):
         self._whole_waiting = False
         self._whole = None
         self._fps_max = None
+        self._present = {}                # optional property -> whether the driver has it
 
     # -- PictureSource -----------------------------------------------------------------------------------------------
 
@@ -302,7 +306,8 @@ class IndiStreamSource(object):
             client.set_number(device, 'CCD_STREAM_FRAME', {'X': 0, 'Y': 0, 'WIDTH': w, 'HEIGHT': h},
                               timeout=SET_TIMEOUT_S)
             client.set_switch(device, 'CCD_STREAM_ENCODER', on_switches=['RAW'])
-            client.set_switch(device, 'STREAM_FULL_DEPTH', on_switches=['FULL_DEPTH_16BIT'])
+            if self._has('STREAM_FULL_DEPTH', 'switch'):
+                client.set_switch(device, 'STREAM_FULL_DEPTH', on_switches=['FULL_DEPTH_16BIT'])
             self._set_rate()
             self._stream(True)
 
@@ -310,11 +315,23 @@ class IndiStreamSource(object):
         client, device = self.client, _device(self.client)
         with self._cond:
             exposure, gain = self._exposure, self._gain
-        client.set_number(device, 'LIMITS', {'LIMITS_PREVIEW_FPS': self._fps(exposure)}, timeout=SET_TIMEOUT_S)
-        client.set_number(device, 'CCD_CONTROLS', {'Gain': gain}, timeout=SET_TIMEOUT_S)
+        if self._has('LIMITS', 'number'):
+            client.set_number(device, 'LIMITS', {'LIMITS_PREVIEW_FPS': self._fps(exposure)}, timeout=SET_TIMEOUT_S)
+        if self._has('CCD_CONTROLS', 'number'):
+            client.set_number(device, 'CCD_CONTROLS', {'Gain': gain}, timeout=SET_TIMEOUT_S)
         client.set_number(device, 'STREAMING_EXPOSURE',
                           {'STREAMING_EXPOSURE_VALUE': exposure, 'STREAMING_DIVISOR_VALUE': 1},
                           timeout=SET_TIMEOUT_S)
+
+    def _has(self, name, ctl_type) -> bool:
+        if name not in self._present:
+            try:
+                self.client.get_control(_device(self.client), name, ctl_type, timeout=CONTROL_TIMEOUT_S)
+                self._present[name] = True
+            except Exception:
+                logger.warning('Focus: the camera driver has no %s; it is left as it is', name)
+                self._present[name] = False
+        return self._present[name]
 
     def _stream(self, on):
         self.client.set_switch(_device(self.client), 'CCD_VIDEO_STREAM',

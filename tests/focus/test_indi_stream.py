@@ -138,6 +138,23 @@ def test_indi_stream_start_order():
     src.stop()
 
 
+def test_driver_specific_properties_are_skipped_when_absent():
+    # STREAM_FULL_DEPTH and CCD_CONTROLS.Gain are ZWO's; LIMITS comes with INDI's stream manager. A driver without
+    # one still streams, and IndiClient.set_switch/set_number would otherwise wait out their full default timeout.
+    client = FakeClient()
+    for name in ('STREAM_FULL_DEPTH',):
+        del client.switches[name]
+    for name in ('LIMITS', 'CCD_CONTROLS'):
+        del client.numbers[name]
+    src = IndiStreamSource(client, sensor=SENSOR)
+    src.start((0, 0, 64, 64), 0.2, 150)
+    src.set_camera(0.5, 10)
+    names = [c[1] for c in client.taken()]
+    assert not {'STREAM_FULL_DEPTH', 'LIMITS', 'CCD_CONTROLS'} & set(names)
+    assert names.count('STREAMING_EXPOSURE') == 2
+    src.stop()
+
+
 def test_indi_stream_whole_sensor_when_no_region():
     client = FakeClient()
     src = IndiStreamSource(client, sensor=SENSOR)
