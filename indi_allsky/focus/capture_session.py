@@ -47,7 +47,6 @@ from indi_allsky.focus.sources import StillsSource
 logger = logging.getLogger('indi_allsky')
 
 
-DEFAULT_ADDRESS = '/var/lib/indi-allsky/focus-session.sock'
 STATE_SUFFIX = '.state.json'
 VIDEO_START_EXPOSURE_S = 0.1
 SHORTEST_FLOOR_S = 1e-6      # a driver that reports a minimum exposure of 0 or less

@@ -36,6 +36,8 @@ from indi_allsky.focus.session import MAX_PAGES
 logger = logging.getLogger('indi_allsky')
 
 
+DEFAULT_ADDRESS = '/var/lib/indi-allsky/focus-session.sock'  # flask.json INDI_ALLSKY_FOCUS_ADDRESS, when missing
+
 KIND_JSON = b'J'
 KIND_FRAME = b'F'
 _HEADER = struct.Struct('>cI')

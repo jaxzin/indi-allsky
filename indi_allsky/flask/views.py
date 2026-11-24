@@ -134,6 +134,8 @@ from .youtube_views import YoutubeCallbackView
 from .youtube_views import YoutubeRefreshAuthView
 from .youtube_views import YoutubeRevokeAuthView
 
+from .focus_views import WsFocusView
+
 from ..exceptions import ConfigSaveException
 from ..exceptions import NotFound
 
@@ -14079,6 +14081,7 @@ bp_allsky.add_url_rule('/shell', view_func=ShellView.as_view('shell_view', templ
 bp_allsky.add_url_rule('/ws/shell', view_func=WsShellView.as_view('ws_shell_view'), websocket=True)
 bp_allsky.add_url_rule('/ws/events', view_func=WsEventsView.as_view('ws_events_view'), websocket=True)
 bp_allsky.add_url_rule('/ws/control', view_func=WsControlView.as_view('ws_control_view'), websocket=True)
+bp_allsky.add_url_rule('/ws/focus', view_func=WsFocusView.as_view('ws_focus_view'), websocket=True)
 
 bp_allsky.add_url_rule('/drives', view_func=DriveManagerView.as_view('drive_manager_view', template_name='drive_manager.html'))
 bp_allsky.add_url_rule('/ajax/drives', view_func=AjaxDriveManagerView.as_view('ajax_drive_manager_view'))

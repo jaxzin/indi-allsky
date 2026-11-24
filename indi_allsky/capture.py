@@ -23,7 +23,7 @@ import queue
 from . import constants
 from . import camera as camera_module
 
-from .focus.capture_session import DEFAULT_ADDRESS as FOCUS_DEFAULT_ADDRESS
+from .focus.link import DEFAULT_ADDRESS as FOCUS_DEFAULT_ADDRESS
 from .focus.capture_session import FocusGlue
 from .focus.capture_session import open_link as focus_open_link
 from .focus.capture_session import state_path_for as focus_state_path_for
