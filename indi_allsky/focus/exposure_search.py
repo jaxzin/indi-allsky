@@ -56,11 +56,9 @@ class ExposureSearch(object):
         self.exposure = float(start)
         self._final: SearchStep | None = None
 
-
     def _finish(self, message: str) -> SearchStep:
         self._final = SearchStep(self.exposure, True, message)
         return self._final
-
 
     def step(self, star_count: int, level: str) -> SearchStep:
         if self._final is not None:

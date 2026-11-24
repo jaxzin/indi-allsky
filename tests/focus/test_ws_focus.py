@@ -13,11 +13,9 @@ import json
 import logging
 import queue
 import socket
-import sys
 import threading
 import time
 import types
-from unittest import mock
 
 import pytest
 
