@@ -841,3 +841,61 @@ def test_preview_before_any_frame_uses_the_source_bayer(session, source, monkeyp
     ctrl.handle(page.cid, {'kind': 'preview'})
     page.json('preview', pump=ctrl.service)
     assert seen == ['RGGB']
+
+
+# --- camera limits (Task 12 fix round 1) ---------------------------------------------------------------------------
+
+LIMITS = {'exposure_min': 0.001, 'exposure_max': 5.0, 'gain_min': 0.0, 'gain_max': 400.0}
+
+
+def test_mode_carries_the_camera_limits(connect, make):
+    cid, page = connect()
+    ctrl = make(exposure=2.0, **LIMITS)
+    ctrl.begin(cid)
+    mode = page.json('mode')
+    assert {k: mode[k] for k in LIMITS} == LIMITS
+
+
+def test_mode_limits_are_null_when_unknown(connect, make):
+    cid, page = connect()
+    ctrl = make(exposure=2.0)
+    ctrl.begin(cid)
+    mode = page.json('mode')
+    assert [mode[k] for k in LIMITS] == [None, None, None, None]
+
+
+@pytest.mark.parametrize('exposure, gain, message', [
+    (6.0, 100, 'exposure'),
+    (0.0005, 100, 'exposure'),
+    (1.0, 401, 'gain'),
+])
+def test_set_camera_outside_the_limits_is_refused_and_never_reaches_the_camera(
+        connect, make, source, exposure, gain, message):
+    cid, page = connect()
+    ctrl = make(exposure=2.0, **LIMITS)
+    ctrl.begin(cid)
+    page.json('mode')
+    ctrl.handle(cid, {'kind': 'set_camera', 'exposure': exposure, 'gain': gain, 'cmd_id': 9})
+    err = page.json('error', command='set_camera')
+    expected = controller_mod.MSG_EXPOSURE_RANGE if message == 'exposure' else controller_mod.MSG_GAIN_RANGE
+    assert err['message'] == expected
+    assert err['cmd_id'] == 9
+    assert 'set_camera' not in source.kinds()
+    assert ctrl.active
+    assert ctrl.ledger.effective_before(1e12) == 0
+
+
+def test_set_camera_at_the_limits_is_taken(connect, make, source):
+    cid, page = connect()
+    ctrl = make(exposure=2.0, **LIMITS)
+    ctrl.begin(cid)
+    ctrl.handle(cid, {'kind': 'set_camera', 'exposure': 5.0, 'gain': 400})
+    assert ('set_camera', 5.0, 400.0) in source.calls
+
+
+def test_errors_carry_the_command_id(session):
+    ctrl, page = session
+    ctrl.handle(page.cid, {'kind': 'set_region', 'roi': 'x', 'cmd_id': 12})
+    assert page.json('error', command='set_region')['cmd_id'] == 12
+    ctrl.handle(page.cid, {'kind': 'set_region', 'roi': 'x', 'cmd_id': 'bad'})
+    assert page.json('error', command='set_region')['cmd_id'] is None

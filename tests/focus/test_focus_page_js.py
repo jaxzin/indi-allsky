@@ -106,3 +106,75 @@ def test_live_rate_is_what_arrives_not_one_over_exposure():
 
     assert got == ['Live video · 10 pictures a second', 'Live video · 2 pictures a second', 'Live video',
                    'Still pictures']
+
+
+def test_pending_commands_add_and_clear_on_the_picture_that_shows_them():
+    got = run('let p = []; p = h.pendingAdd(p, 5, "camera"); p = h.pendingAdd(p, 6, "motor");'
+              ' p = h.pendingAdd(p, 8, "region");'
+              ' console.log(JSON.stringify([p.length, h.pendingShown(p, 4).length, h.pendingShown(p, 6),'
+              ' h.pendingShown(p, 9)]));')
+
+    assert got == [3, 3, [{'id': 8, 'kind': 'region'}], []]
+
+
+def test_pending_drop_when_the_command_never_left():
+    got = run('const p = [{id: 5, kind: "camera"}, {id: 6, kind: "motor"}];'
+              ' console.log(JSON.stringify([h.pendingDrop(p, 6), h.pendingDrop(p, 99)]));')
+
+    assert got == [[{'id': 5, 'kind': 'camera'}], [{'id': 5, 'kind': 'camera'}, {'id': 6, 'kind': 'motor'}]]
+
+
+def test_pending_refused_by_id_or_newest_of_its_kind():
+    got = run('const p = [{id: 5, kind: "camera"}, {id: 6, kind: "motor"}, {id: 7, kind: "camera"}];'
+              ' console.log(JSON.stringify([h.pendingRefused(p, "set_camera", 5).map(x => x.id),'
+              ' h.pendingRefused(p, "set_camera", null).map(x => x.id),'
+              ' h.pendingRefused(p, "moved", undefined).map(x => x.id),'
+              ' h.pendingRefused(p, "start", null).map(x => x.id)]));')
+
+    assert got == [[6, 7], [5, 6], [5, 7], [5, 6, 7]]
+
+
+def test_exposure_choices_stay_inside_the_camera_limits():
+    got = run('const L = [0.001, 0.01, 0.1, 1, 5, 10];'
+              ' console.log(JSON.stringify([h.exposureChoices(L, 0.1, 0.005, 2),'
+              ' h.exposureChoices(L, 0.1, null, null)]));')
+
+    assert got == [[0.005, 0.01, 0.1, 1, 2], [0.001, 0.01, 0.1, 1, 5, 10]]
+
+
+def test_gain_range_from_the_camera_with_a_fine_step_for_small_ranges():
+    got = run('console.log(JSON.stringify([h.gainRange(0, 10, 2), h.gainRange(0, 510, 7),'
+              ' h.gainRange(null, null, 100)]));')
+
+    assert got[0] == {'min': 0, 'max': 10, 'step': pytest.approx(0.1)}
+    assert got[1] == {'min': 0, 'max': 510, 'step': 1}
+    assert got[2] == {'min': 0, 'max': 600, 'step': 1}
+
+
+def test_fractional_gain_reads_sensibly():
+    got = run('console.log(JSON.stringify([h.fmtGain(1.25), h.fmtGain(1.2), h.fmtGain(12.34)]));')
+
+    assert got == ['1.25', '1.2', '12.3']
+
+
+def test_first_picture_is_not_stalled_before_its_download():
+    got = run('console.log(JSON.stringify([h.expectedGap(2, []), h.expectedGap(0.1, [0.5, 0.2, 0.3]),'
+              ' h.expectedGap(2, [0.5])]));')
+
+    assert got == [4, 0.3, 2]
+
+
+def test_region_box_on_a_whole_frame_picture_is_centred_and_on_the_bayer_grid():
+    got = run('console.log(JSON.stringify([h.regionBox(3000, 2000, null), h.regionBox(801, 601, null),'
+              ' h.regionBox(3000, 2000, [2500, 100, 1024, 1024])]));')
+
+    assert got[0] == {'x': 988, 'y': 488, 'w': 1024, 'h': 1024}
+    assert got[1] == {'x': 100, 'y': 0, 'w': 600, 'h': 600}
+    assert got[2] == {'x': 1976, 'y': 100, 'w': 1024, 'h': 1024}
+
+
+def test_star_states_in_words():
+    got = run('console.log(JSON.stringify(["kept", "weak", "dropped", "pinned", "saturated", "odd"]'
+              '.map(h.starWord)));')
+
+    assert got == ['measured', 'too faint', 'left out', 'the only one measured', 'too bright', 'odd']

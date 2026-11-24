@@ -28,6 +28,7 @@ CCD_INFO = {
     'CCD_EXPOSURE': {'CCD_EXPOSURE_VALUE': {'min': 0.000032, 'max': 3600.0}},
     'CCD_INFO': {'CCD_BITSPERPIXEL': {'current': 16}},
     'CCD_FRAME': {'WIDTH': {'max': 640}, 'HEIGHT': {'max': 480}},
+    'GAIN_INFO': {'current': 7.0, 'min': 0.0, 'max': 510.0, 'step': 1.0},
 }
 
 
@@ -399,6 +400,22 @@ def test_test_camera_streams_frames(fake_pyindi):
 def test_ceiling_is_the_configured_exposure_max_not_the_drivers(rig):
     start_session(rig)  # the driver allows 3600 s; the config says 5 s
     assert rig.worker.focus.controller._search.ceiling == 5.0
+    rig.worker.focus.stop('done')
+
+
+def test_controller_gets_the_camera_limits_capture_already_knows(rig):
+    start_session(rig)  # exposure: the driver's shortest to the configured ceiling; gain: the driver's GAIN_INFO
+    assert rig.worker.focus.controller.limits == {
+        'exposure_min': 0.000032, 'exposure_max': 5.0, 'gain_min': 0.0, 'gain_max': 510.0}
+    rig.worker.focus.stop('done')
+
+
+def test_unknown_limits_are_none(rig):
+    rig.glue.ccd_info = {k: v for k, v in CCD_INFO.items() if k not in ('GAIN_INFO', 'CCD_EXPOSURE')}
+    start_session(rig)
+    limits = rig.worker.focus.controller.limits
+    assert (limits['exposure_min'], limits['gain_min'], limits['gain_max']) == (None, None, None)
+    assert limits['exposure_max'] == 5.0  # the config's ceiling is always known
     rig.worker.focus.stop('done')
 
 

@@ -15,6 +15,7 @@ No import of PyIndi, Flask or capture: tests drive this with fake cameras.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from typing import Callable
@@ -86,6 +87,19 @@ def _ccd(ccd_info: dict, prop: str, elem: str, key: str) -> Optional[float]:
     return None if value is None else float(value)
 
 
+def _gain_info(ccd_info: dict, key: str) -> Optional[float]:
+    """ccd_info['GAIN_INFO'] is one level shallower than the INDI properties: {'min': .., 'max': ..}."""
+    try:
+        value = ccd_info['GAIN_INFO'][key]
+    except (KeyError, TypeError):
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
 def default_region(width: int, height: int):
     """A centred square of at most VIDEO_REGION_PX, on the Bayer grid."""
     size = min(VIDEO_REGION_PX, width, height)
@@ -145,7 +159,8 @@ class FocusGlue(object):
 
         self.camera.abortCcdExposure()  # the normal exposure in progress is discarded
 
-        shortest = _ccd(self.ccd_info, 'CCD_EXPOSURE', 'CCD_EXPOSURE_VALUE', 'min')
+        driver_shortest = _ccd(self.ccd_info, 'CCD_EXPOSURE', 'CCD_EXPOSURE_VALUE', 'min')
+        shortest = driver_shortest
         if shortest is None or shortest <= 0:
             shortest = SHORTEST_FLOOR_S
         ceiling = default_ceiling(self._exposure_max)  # the config's longest exposure, not the driver's
@@ -172,6 +187,11 @@ class FocusGlue(object):
                 source, self.link, SessionClock(), rig, False,
                 epoch=self._epoch, exposure=start, gain=float(self._gain()), roi=roi,
                 search=ExposureSearch(shortest, ceiling, start),
+                # the same sources capture checks its own settings against (capture.py: CCD_EXPOSURE, GAIN_INFO)
+                exposure_min=driver_shortest if driver_shortest is not None and driver_shortest > 0 else None,
+                exposure_max=ceiling,
+                gain_min=_gain_info(self.ccd_info, 'min'),
+                gain_max=_gain_info(self.ccd_info, 'max'),
             )
         except Exception:
             if self._saved is not None:

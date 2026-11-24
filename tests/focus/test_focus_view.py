@@ -191,7 +191,8 @@ def test_watchers_get_no_controls(page):
         assert status == 200
         assert 'No focus session is running. An admin can start one.' in html
         for element in ('focus-start', 'fs-done', 'fs-pick', 'fs-keep-going', 'fs-apply', 'fs-region',
-                        'FOCUS_CCW', 'FOCUS_CW'):
+                        'fs-exp-btn', 'fs-region-btn', 'fs-snr', 'fs-stars-chip', 'FOCUS_CCW', 'FOCUS_CW',
+                        'STEP_DEGREES'):
             assert 'id="{0:s}"'.format(element) not in html, element
         assert 'js/focus_session.js' in html  # they still watch
 
@@ -204,5 +205,5 @@ def test_stills_rig_shows_the_reason(page):
 
     assert status == 200
     assert 'data-focus-session' in html
-    assert 'data-picture="stills"' in html
     assert 'live video is not available for this camera type' in html
+    assert 'id="fs-region-btn"' in html  # the crop moves on stills rigs too (spec 6.2)

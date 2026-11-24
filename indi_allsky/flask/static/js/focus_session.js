@@ -126,7 +126,10 @@
     }
 
     function fmtGain(g) {
-        return Math.abs(g - Math.round(g)) < 1e-6 ? String(Math.round(g)) : g.toFixed(1);
+        if (Math.abs(g - Math.round(g)) < 1e-6) {
+            return String(Math.round(g));
+        }
+        return Math.abs(g) < 10 ? String(Number(g.toFixed(2))) : g.toFixed(1);
     }
 
     // The status line's words when the picture is live (section 6.4). interval: the measured s between pictures
@@ -146,10 +149,111 @@
         return 'Live video · ' + n + (n === 1 ? ' picture a second' : ' pictures a second');
     }
 
+    // -- commands not in the picture yet: [{id, kind}], kind 'motor' | 'camera' | 'region'. Each returns a new list.
+
+    function pendingAdd(list, id, kind) {
+        return list.concat([{id: id, kind: kind}]);
+    }
+
+    // A picture marked cmdId shows every command up to and including it.
+    function pendingShown(list, cmdId) {
+        return list.filter(function (p) { return p.id > cmdId; });
+    }
+
+    function pendingDrop(list, id) {
+        return list.filter(function (p) { return p.id !== id; });
+    }
+
+    // An error refusing a command: drop that command by its id; with no id, the newest of the command's kind.
+    var COMMAND_KIND = {set_camera: 'camera', set_region: 'region', moved: 'motor'};
+    function pendingRefused(list, command, cmdId) {
+        if (typeof cmdId === 'number') {
+            return pendingDrop(list, cmdId);
+        }
+        var kind = COMMAND_KIND[command];
+        for (var i = list.length - 1; kind && i >= 0; i--) {
+            if (list[i].kind === kind) {
+                return list.slice(0, i).concat(list.slice(i + 1));
+            }
+        }
+        return list;
+    }
+
+    // -- the camera controls ----------------------------------------------------------------------------------------
+
+    function known(v) {
+        return typeof v === 'number' && isFinite(v);
+    }
+
+    // The exposure choices: the ladder inside the camera's limits, plus the current exposure.
+    function exposureChoices(ladder, current, min, max) {
+        var out = ladder.filter(function (x) {
+            return (!known(min) || x >= min) && (!known(max) || x <= max) && Math.abs(x - current) > 1e-9;
+        });
+        if (known(min) && (!out.length || out[0] > min) && Math.abs(min - current) > 1e-9) {
+            out.push(min);
+        }
+        if (known(max) && Math.abs(max - current) > 1e-9 && out.indexOf(max) < 0) {
+            out.push(max);
+        }
+        out.push(current);
+        return out.sort(function (a, b) { return a - b; });
+    }
+
+    // The gain slider: the camera's range when known (else 0 .. 600, or twice the current gain), with a fine step
+    // when the range is small.
+    function gainRange(min, max, current) {
+        var lo = known(min) ? min : 0;
+        var hi = known(max) && max > lo ? max : Math.max(600, Math.ceil(current * 2), lo + 1);
+        lo = Math.min(lo, current);
+        hi = Math.max(hi, current);
+        var span = hi - lo;
+        return {min: lo, max: hi, step: span < 50 ? span / 100 : 1};
+    }
+
+    // How long to expect between pictures. Before two have arrived there is no measured gap, and a still picture
+    // also takes its download: allow for that so the first picture is not called Stalled.
+    var DOWNLOAD_ALLOWANCE_S = 2.0;
+    function expectedGap(exposure, gaps) {
+        var exp = known(exposure) && exposure > 0 ? exposure : 0.1;
+        if (!gaps.length) {
+            return exp + DOWNLOAD_ALLOWANCE_S;
+        }
+        var sorted = gaps.slice().sort(function (a, b) { return a - b; });
+        return Math.max(exp, sorted[Math.floor(sorted.length / 2)]);
+    }
+
+    // The box on the whole-sensor picture: the current region, or (whole-frame pictures) capture's first-region
+    // size centred: capture_session.default_region, a square of at most VIDEO_REGION_PX on the Bayer grid.
+    var REGION_PX = 1024;
+    function regionBox(W, H, roi) {
+        if (Array.isArray(roi) && roi.length === 4) {
+            var w = Math.min(W, roi[2]);
+            var h = Math.min(H, roi[3]);
+            return {x: Math.min(roi[0], W - w), y: Math.min(roi[1], H - h), w: w, h: h};
+        }
+        var size = Math.min(REGION_PX, W, H);
+        size -= size % 2;
+        var x = Math.floor((W - size) / 2);
+        var y = Math.floor((H - size) / 2);
+        return {x: x - x % 2, y: y - y % 2, w: size, h: size};
+    }
+
+    var STAR_WORDS = {
+        kept: 'measured', weak: 'too faint', dropped: 'left out', pinned: 'the only one measured',
+        saturated: 'too bright'
+    };
+    function starWord(state) {
+        return Object.prototype.hasOwnProperty.call(STAR_WORDS, state) ? STAR_WORDS[state] : String(state);
+    }
+
     var pure = {
         HEADER_SIZE: HEADER_SIZE, parseHeader: parseHeader, bestOffset: bestOffset, clockSample: clockSample,
         statusState: statusState, endedText: endedText, nearestRing: nearestRing, nextCmdId: nextCmdId,
-        fmtAge: fmtAge, fmtExposure: fmtExposure, fmtGain: fmtGain, liveText: liveText
+        fmtAge: fmtAge, fmtExposure: fmtExposure, fmtGain: fmtGain, liveText: liveText,
+        pendingAdd: pendingAdd, pendingShown: pendingShown, pendingDrop: pendingDrop, pendingRefused: pendingRefused,
+        exposureChoices: exposureChoices, gainRange: gainRange, expectedGap: expectedGap, regionBox: regionBox,
+        starWord: starWord
     };
     if (typeof module !== 'undefined' && module.exports) {
         module.exports = pure;
@@ -177,6 +281,8 @@
     var MSG_NOT_CONNECTED = 'Not connected to the capture program yet. Try again in a moment.';
     var MSG_MOVE_FAILED = 'The lens did not move.';
     var MSG_WARN = 'Nobody has touched this page for a while. Normal pictures resume in {0} s.';
+    var MSG_WARN_WATCHER = 'Nobody is using the focus controls. The focus session ends in {0} s unless an admin ' +
+        'keeps it going.';
     var ST = {kept: '#4ade80', weak: '#9ca3af', saturated: '#fbbf24', dropped: '#f87171', pinned: '#60a5fa'};
 
     var root = document.getElementById('focus-session');
@@ -184,13 +290,14 @@
     var phone = window.matchMedia('(max-width: 767px)');
 
     var S = {
-        canStart: root.getAttribute('data-can-start') === '1',
-        motor: root.getAttribute('data-motor') === '1',
-        ws: null, retry: 0, retryTimer: null,
+        ws: null, retry: 0, retryTimer: null, rejoined: false,
         session: 'idle', controls: false, rig: null,
         mode: null, reading: null, stars: [], minSnr: 8, snrHeld: null, snrTimer: null, picking: false,
-        drawnFrame: -1, captureTime: null, lastArrival: null, intervals: [], highestCmd: 0, lastCmd: 0,
-        offset: 0, pingSeq: 0, pingsOut: {}, burst: [], pingTimer: null,
+        drawnFrame: -1, captureTime: null, lastArrival: null, intervals: [], highestCmd: 0,
+        // ids start from the clock in seconds, so a new page's first command is above every earlier page's ids
+        // (capture marks pictures with the highest id that took effect, from any page)
+        lastCmd: Math.floor(Date.now() / 1000),
+        offset: 0, haveOffset: false, pingSeq: 0, pingsOut: {}, burst: [], pingTimer: null,
         pending: [],                // [{id, kind}] this page's commands not in the picture yet
         decoding: false, nextFrame: null,
         preview: null,              // {roiKey} while a whole-sensor picture is wanted
@@ -247,6 +354,7 @@
         S.ws = ws;
         ws.onopen = function () {
             S.retry = 0;
+            S.rejoined = true;  // the next active state starts the live view afresh: it may be another session
             send({kind: 'hello'});
             pingBurst();
             setStartEnabled();
@@ -292,9 +400,20 @@
         }
     }
 
-    // Every 10 s: 8 pings one after another; the shortest round trip of the burst sets the clock offset.
+    // Every 10 s: 8 pings one after another; the shortest round trip of a finished burst sets the clock offset.
+    // Until the first burst finishes, its best sample so far stands in.
     function pingBurst() {
+        if (S.burst.length) {
+            S.offset = bestOffset(S.burst);
+            S.haveOffset = true;
+        }
         S.burst = [];
+        var stale = nowS() - PING_EVERY_MS / 1000;
+        Object.keys(S.pingsOut).forEach(function (id) {
+            if (S.pingsOut[id] < stale) {
+                delete S.pingsOut[id];  // a pong that never came
+            }
+        });
         var sent = 0;
         clearTimeout(S.pingTimer);
         (function one() {
@@ -315,7 +434,10 @@
         }
         delete S.pingsOut[msg.id];
         S.burst.push(clockSample(sent, nowS(), msg.t));
-        S.offset = bestOffset(S.burst);
+        if (!S.haveOffset || S.burst.length >= PINGS_PER_BURST) {
+            S.offset = bestOffset(S.burst);
+            S.haveOffset = S.haveOffset || S.burst.length >= PINGS_PER_BURST;
+        }
     }
 
     function onJson(msg) {
@@ -340,15 +462,14 @@
         if (msg.rig && typeof msg.rig === 'object') {
             S.rig = msg.rig;
         }
-        if (typeof msg.motor === 'boolean') {
-            S.motor = msg.motor;
-        }
         if (msg.session === 'active') {
-            if (S.session !== 'active') {
+            if (S.session !== 'active' || S.rejoined) {
                 enterLive();
             }
+            S.rejoined = false;
             S.warnUntil = typeof msg.idle_warning === 'number' ? Date.now() + msg.idle_warning * 1000 : null;
         } else {
+            S.rejoined = false;
             if (S.session === 'active') {
                 leaveLive();
             }
@@ -367,14 +488,10 @@
             toast(text);
         }
         // a refused command never takes effect: its sign must not wait for it
-        var kind = {set_camera: 'camera', set_region: 'region'}[msg.command];
-        if (kind) {
-            for (var i = S.pending.length - 1; i >= 0; i--) {
-                if (S.pending[i].kind === kind) {
-                    S.pending.splice(i, 1);
-                    break;
-                }
-            }
+        var before = S.pending.length;
+        S.pending = pendingRefused(S.pending, msg.command, msg.cmd_id);
+        if (S.pending.length !== before && S.session === 'active') {
+            renderNumber();
         }
         if (msg.command === 'preview') {
             closeRegion();
@@ -411,6 +528,7 @@
         if (!h || S.session !== 'active') {
             return;
         }
+        S.highestCmd = Math.max(S.highestCmd, h.cmd_id);
         var t = nowS();
         if (S.lastArrival !== null) {
             S.intervals.push(t - S.lastArrival);
@@ -430,7 +548,7 @@
         S.decoding = true;
         var blob = new Blob([new Uint8Array(buf, HEADER_SIZE)], {type: 'image/jpeg'});
         createImageBitmap(blob).then(function (bmp) {
-            if (h.frame_no > S.drawnFrame || h.frame_no < S.drawnFrame - 1000) {  // a new session counts again
+            if (h.frame_no > S.drawnFrame) {  // a new session (counting from 1 again) resets drawnFrame in enterLive
                 var c = $id('fs-canvas');
                 if (c.width !== bmp.width || c.height !== bmp.height) {
                     c.width = bmp.width;
@@ -458,23 +576,27 @@
 
     // The picture on screen carries the highest command that had taken effect when it was exposed.
     function pictureCmd(cmdId) {
-        S.highestCmd = Math.max(S.highestCmd, cmdId);
         var before = S.pending.length;
-        S.pending = S.pending.filter(function (p) { return p.id > cmdId; });
+        S.pending = pendingShown(S.pending, cmdId);
         if (S.pending.length !== before) {
             renderNumber();
         }
     }
 
+    // A command id for msg, and the sign that waits for it. Motor moves are not sent here (the POST moves the lens,
+    // `moved` follows it), so they are only marked when the socket is up to send `moved` afterwards.
     function command(msg, kind) {
         var id = nextCmdId(S.lastCmd, S.highestCmd);
         S.lastCmd = id;
         msg.cmd_id = id;
-        if (kind !== 'motor' && !send(msg)) {
-            toast(MSG_NOT_CONNECTED);
+        var connected = kind === 'motor' ? !!S.ws && S.ws.readyState === WebSocket.OPEN : send(msg);
+        if (!connected) {
+            if (kind !== 'motor') {
+                toast(MSG_NOT_CONNECTED);
+            }
             return null;
         }
-        S.pending.push({id: id, kind: kind});
+        S.pending = pendingAdd(S.pending, id, kind);
         renderNumber();
         return id;
     }
@@ -490,9 +612,7 @@
     }
 
     function expectedInterval() {
-        var exp = S.mode && typeof S.mode.exposure === 'number' && S.mode.exposure > 0 ? S.mode.exposure : 0.1;
-        var gap = medianInterval();
-        return gap === null ? exp : Math.max(exp, gap);
+        return expectedGap(S.mode ? S.mode.exposure : null, S.intervals);
     }
 
     function renderStatus() {
@@ -527,8 +647,6 @@
             text = reason;
         }
         setText($id('fs-mode'), text);
-        // a whole-frame picture (stills rigs) has no region to move
-        show($id('fs-region-btn'), !!(m && Array.isArray(m.roi)));
         if (m) {
             setText($id('fs-exp-btn'), 'Exposure ' + fmtExposure(m.exposure) + ' ▾');
             setText($id('fs-gain-btn'), 'Gain ' + fmtGain(m.gain) + ' ▾');
@@ -538,6 +656,9 @@
     // ==== the number =============================================================================================
 
     function onReading(msg) {
+        if (typeof msg.cmd_id === 'number') {
+            S.highestCmd = Math.max(S.highestCmd, msg.cmd_id);
+        }
         S.reading = msg;
         traceAdd(msg);
         renderNumber();
@@ -547,9 +668,13 @@
     function onMeasure(msg) {
         var was = S.traceMeasure;
         if (was && msg.measure !== was && (msg.measure === 'stars' || msg.measure === 'contrast')) {
-            setText($id('fs-progress'), msg.measure === 'stars' ?
-                'Stars found. The trace starts again with star size.' :
-                'No stars found. The trace starts again with the contrast score.');
+            var trace = !!$id('fs-trace');  // hand-turned rigs only; motor rigs have no trace in PR 1
+            var stars = msg.measure === 'stars';
+            setText($id('fs-progress'), trace ?
+                (stars ? 'Stars found. The trace starts again with star size.' :
+                    'No stars found. The trace starts again with the contrast score.') :
+                (stars ? 'Stars found. The number is now star size.' :
+                    'No stars found. The number is now the contrast score.'));
         }
         traceReset(msg.measure);
     }
@@ -747,7 +872,7 @@
             var st = shownState(s.id, s.state);
             b.style.color = ST[st] || '';
             b.textContent = 'Star ' + (s.id + 1) + ' · S/N ' + (typeof s.snr1 === 'number' ? s.snr1.toFixed(0) : '?') +
-                ' · ' + st;
+                ' · ' + starWord(st);
             b.addEventListener('click', function () { tapStar(s.id); });
             li.appendChild(b);
             list.appendChild(li);
@@ -784,6 +909,7 @@
     // ==== camera and region controls =============================================================================
 
     var expChoices = EXPOSURES.slice();
+    var gainSpan = {min: 0, max: 600, step: 1};
     var camTouched = {exp: false, gain: false};
 
     function openCamera() {
@@ -796,16 +922,19 @@
             return;
         }
         // the camera's own value is always on the slider, so Apply without touching it sends it back unchanged
-        var exp = S.mode.exposure;
-        var gain = S.mode.gain;
-        expChoices = EXPOSURES.filter(function (x) { return Math.abs(x - exp) > 1e-9; }).concat([exp]);
-        expChoices.sort(function (a, b) { return a - b; });
+        var m = S.mode;
+        var exp = m.exposure;
+        var gain = m.gain;
+        // the camera's limits come in `mode`; a limit capture does not know is null and the defaults stand
+        expChoices = exposureChoices(EXPOSURES, exp, m.exposure_min, m.exposure_max);
         var r = $id('fs-exp');
         r.max = expChoices.length - 1;
         r.value = expChoices.indexOf(exp);
+        gainSpan = gainRange(m.gain_min, m.gain_max, gain);
         var g = $id('fs-gain');
-        g.max = Math.max(600, Math.ceil(gain * 2));
-        g.step = 'any';
+        g.min = gainSpan.min;
+        g.max = gainSpan.max;
+        g.step = gainSpan.step;
         g.value = gain;
         camTouched = {exp: false, gain: false};
         showCamera();
@@ -815,7 +944,10 @@
         if (!camTouched.gain) {
             return S.mode.gain;
         }
-        return Math.round(Number($id('fs-gain').value));
+        var v = Number($id('fs-gain').value);
+        // whole numbers on a wide range; two decimals on a narrow one (step = range / 100)
+        v = gainSpan.step >= 1 ? Math.round(v) : Math.round(v * 100) / 100;
+        return Math.min(gainSpan.max, Math.max(gainSpan.min, v));
     }
 
     function showCamera() {
@@ -845,7 +977,7 @@
     }
 
     function openRegion() {
-        if (S.preview || !S.mode || !Array.isArray(S.mode.roi)) {
+        if (S.preview || !S.mode) {
             return;
         }
         if (!send({kind: 'preview'})) {
@@ -872,11 +1004,15 @@
         }
         var W = msg.width;
         var H = msg.height;
-        var roi = S.mode && Array.isArray(S.mode.roi) ? S.mode.roi : null;
-        var wh = pictureSize();
-        var w = Math.min(W, roi ? roi[2] : wh[0]);
-        var h = Math.min(H, roi ? roi[3] : wh[1]);
-        box = {x: roi ? roi[0] : (W - w) / 2, y: roi ? roi[1] : (H - h) / 2, w: w, h: h, W: W, H: H};
+        if (!known(W) || !known(H) || W < 2 || H < 2) {
+            closeRegion();
+            return;
+        }
+        // the current region, or for a whole-frame picture (stills, or a sensor size capture did not know) the
+        // size capture would start a region at, centred
+        box = regionBox(W, H, S.mode ? S.mode.roi : null);
+        box.W = W;
+        box.H = H;
         $id('fs-region-img').src = 'data:image/jpeg;base64,' + msg.jpeg;
         placeBox();
         show($id('fs-region-wait'), false);
@@ -944,13 +1080,19 @@
             data: JSON.stringify(data),
             success: function () {
                 ccw.disabled = cw.disabled = false;
-                // pictures exposed from 0.5 s after this reaches capture carry the id (section 9.7 A)
-                send({kind: 'moved', cmd_id: id});
+                // pictures exposed from 0.5 s after this reaches capture carry the id (section 9.7 A); a `moved`
+                // that cannot be sent would never show, so its sign goes
+                if (id !== null && !send({kind: 'moved', cmd_id: id})) {
+                    S.pending = pendingDrop(S.pending, id);
+                    renderNumber();
+                }
             },
             error: function (resp) {
                 ccw.disabled = cw.disabled = false;
-                S.pending = S.pending.filter(function (p) { return p.id !== id; });
-                renderNumber();
+                if (id !== null) {
+                    S.pending = pendingDrop(S.pending, id);
+                    renderNumber();
+                }
                 var text = MSG_MOVE_FAILED;
                 try {
                     var errors = JSON.parse(resp.responseText);
@@ -1055,7 +1197,7 @@
         show($id('fs-warn'), on);
         if (on) {
             var left = Math.max(0, Math.ceil((S.warnUntil - Date.now()) / 1000));
-            setText($id('fs-warn-text'), MSG_WARN.replace('{0}', String(left)));
+            setText($id('fs-warn-text'), (S.controls ? MSG_WARN : MSG_WARN_WATCHER).replace('{0}', String(left)));
         }
     }
 

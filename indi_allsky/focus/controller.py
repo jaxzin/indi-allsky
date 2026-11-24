@@ -147,6 +147,8 @@ MSG_LOST = 'None of the picked stars is in this picture.'
 MSG_PREVIEW_FAILED = 'Could not take a whole-sensor picture.'
 MSG_PREVIEW_BUSY = 'A whole-sensor picture is already on its way.'
 MSG_SATURATED = 'The picked stars are saturated. Try a shorter exposure.'
+MSG_EXPOSURE_RANGE = 'That exposure is outside what this camera can take. The camera was not changed.'
+MSG_GAIN_RANGE = 'That gain is outside what this camera can take. The camera was not changed.'
 MSG_START_FAILED = 'The focus session could not start.'
 MSG_MISSING_PROPERTY = ('The camera driver has no {0}, which a focus session needs. '
                         'The session did not start and the camera was not changed.')
@@ -206,6 +208,14 @@ def _cmd_id(msg) -> Optional[int]:
     return _int(msg['cmd_id'], 'command id', 0, CMD_ID_MAX)
 
 
+def _echo_id(msg) -> Optional[int]:
+    """A command's id to send back with an error about it; None when it has no valid one."""
+    try:
+        return _cmd_id(msg) if isinstance(msg, dict) else None
+    except _Invalid:
+        return None
+
+
 def _roi(v):
     if v is None:
         return None
@@ -252,8 +262,14 @@ class FocusController(object):
 
     def __init__(self, source, link, clock, rig: RigDecision, motor_configured: bool, *,
                  epoch: Callable[[], float] = time.time, exposure: float = 1.0, gain: float = 0.0, roi=None,
-                 search: Optional[ExposureSearch] = None, saved_camera: Optional[dict] = None):
+                 search: Optional[ExposureSearch] = None, saved_camera: Optional[dict] = None,
+                 exposure_min: Optional[float] = None, exposure_max: Optional[float] = None,
+                 gain_min: Optional[float] = None, gain_max: Optional[float] = None):
+        """exposure_min .. gain_max: what the camera takes (None: not known). The page's controls stay inside them
+        and set_camera refuses anything outside."""
         self.source = source
+        self.limits = {'exposure_min': exposure_min, 'exposure_max': exposure_max,
+                       'gain_min': gain_min, 'gain_max': gain_max}
         self.link = link
         self.rig = rig
         self.motor_configured = bool(motor_configured)
@@ -404,11 +420,12 @@ class FocusController(object):
     def handle(self, client_id: int, msg: dict) -> None:
         """One command from a page. Never raises: a bad command gets an `error` and the session goes on."""
         kind = msg.get('kind') if isinstance(msg, dict) else None
+        echo = _echo_id(msg)
         if not self._active and kind not in OPEN_COMMANDS:
-            self._error(client_id, kind, MSG_NO_SESSION)  # ended (a failed start, say) but not yet reaped
+            self._error(client_id, kind, MSG_NO_SESSION, echo)  # ended (a failed start, say) but not yet reaped
             return
         if kind not in OPEN_COMMANDS and not self._controls(client_id):
-            self._error(client_id, kind, MSG_CONTROLS)
+            self._error(client_id, kind, MSG_CONTROLS, echo)
             return
         if kind not in OPEN_COMMANDS:
             with self._lock:
@@ -420,12 +437,12 @@ class FocusController(object):
         try:
             handler(client_id, msg)
         except _Invalid as e:
-            self._error(client_id, kind, MSG_INVALID.format(e.args[0]))
+            self._error(client_id, kind, MSG_INVALID.format(e.args[0]), echo)
         except Exception:
             # a bug, not a camera fault (source errors end the session in _source_call): keep the session for
             # every page and tell this one. The message is not logged: it is page input.
             logger.exception('Focus: the %s command failed', kind)
-            self._error(client_id, kind, MSG_COMMAND_FAILED)
+            self._error(client_id, kind, MSG_COMMAND_FAILED, echo)
 
     def _cmd_ping(self, cid, msg):
         self.link.send_json(cid, {'kind': 'pong', 't': time.time(), 'id': msg.get('id')})
@@ -447,6 +464,15 @@ class FocusController(object):
         exposure = _num(msg.get('exposure'), 'exposure', 0.0, MAX_EXPOSURE_S, low_open=True)
         gain = _num(msg.get('gain'), 'gain', 0.0)
         cmd_id = _cmd_id(msg)
+        lim = self.limits
+        if ((lim['exposure_min'] is not None and exposure < lim['exposure_min'])
+                or (lim['exposure_max'] is not None and exposure > lim['exposure_max'])):
+            self._error(cid, 'set_camera', MSG_EXPOSURE_RANGE, cmd_id)
+            return
+        if ((lim['gain_min'] is not None and gain < lim['gain_min'])
+                or (lim['gain_max'] is not None and gain > lim['gain_max'])):
+            self._error(cid, 'set_camera', MSG_GAIN_RANGE, cmd_id)
+            return
         with self._lock:
             if self._pick_press is not None:
                 busy = True
@@ -456,7 +482,7 @@ class FocusController(object):
                 if cmd_id is not None:
                     self.ledger.begin(cmd_id)
         if busy:
-            self._error(cid, 'set_camera', MSG_PICK_BUSY)
+            self._error(cid, 'set_camera', MSG_PICK_BUSY, cmd_id)
             return
         if not self._source_call('set the exposure', self.source.set_camera, exposure, gain):
             return
@@ -591,9 +617,11 @@ class FocusController(object):
         hello = self.link.client_hello(cid)
         return bool(hello) and hello.get('controls') is True
 
-    def _error(self, cid, command, message):
+    def _error(self, cid, command, message, cmd_id=None):
+        """cmd_id: the refused command's id, so the page stops waiting for that one command to show."""
         self.link.send_json(cid, {'kind': 'error', 'message': message,
-                                  'command': command if isinstance(command, str) else None})
+                                  'command': command if isinstance(command, str) else None,
+                                  'cmd_id': cmd_id})
 
     def _send_state(self, cid=None):
         with self._lock:
@@ -619,6 +647,7 @@ class FocusController(object):
             'exposure': self.exposure,
             'gain': self.gain,
             'roi': list(self.roi) if self.roi is not None else None,
+            **self.limits,
         }
 
     def _star_state(self, s, saturation=True) -> str:
