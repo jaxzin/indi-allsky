@@ -42,11 +42,13 @@ APERTURE_PASSES = 3
 APERTURE_SCALE = 2.5
 MIN_APERTURE_PX = 3.0
 
+# OpenCV names its Bayer codes by a different pixel than sensor vendors do. Same convention as the CFA_* constants in
+# indi_allsky/constants.py (CFA_RGGB = COLOR_BAYER_BG2BGR, ...). The prototype used the literal names (RGGB -> RG).
 _BAYER_TO_GRAY = {
-    'RGGB': cv2.COLOR_BayerRG2GRAY,
-    'GRBG': cv2.COLOR_BayerGR2GRAY,
-    'GBRG': cv2.COLOR_BayerGB2GRAY,
-    'BGGR': cv2.COLOR_BayerBG2GRAY,
+    'RGGB': cv2.COLOR_BayerBG2GRAY,
+    'GRBG': cv2.COLOR_BayerGB2GRAY,
+    'BGGR': cv2.COLOR_BayerRG2GRAY,
+    'GBRG': cv2.COLOR_BayerGR2GRAY,
 }
 
 _NEIGHBOURS = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], np.uint8)

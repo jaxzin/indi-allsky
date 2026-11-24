@@ -40,12 +40,17 @@ def test_one_pixel_star_survives_hot_pixel_fix_and_pick():
     Cross-checked against the prototype (focus_proto.py imported, Proto built without __init__ so no camera opens,
     bayer path, track_snr 4) on this exact frame (synth seed 20261124):
       - prototype: hot pixels found = [(128, 104)]; sigma 0.45 star size 2.158; sigma 1 star size 2.918.
-      - this port: the same hot pixel; sizes 2.158 and 2.918 (asserted below to 0.005).
+      - this port: the same hot pixel; sizes 2.031 and 2.840 (asserted below to 0.005).
+      - Why they differ: the prototype demosaiced RGGB with OpenCV's literal COLOR_BayerRG2GRAY; the port uses the
+        repo's convention (constants.py CFA_RGGB -> OpenCV BG). With the prototype's mapping the port gave exactly
+        2.158 and 2.918, with a bit-identical gray image. The new mapping also centres the sharp star closer to
+        where it was drawn ((100.25, 128.16) vs the prototype's (100.41, 128.27); true (100.3, 128.2)).
 
     The star sits off the pixel centre by (0.3, 0.2). Exactly centred, a sigma 0.45 px star puts 18% of its centre
     pixel's excess in each neighbour, under the 25% rule, so both prototype and port classify it as a hot pixel
     (the prototype then still picked it from its four bright neighbours, at size 2.389).
     """
+    # off-centre on purpose: a pixel-centred sigma 0.45 star is classed as hot (known limitation, as in the prototype)
     small = synth.Star(100.3, 128.2, 0.45, 20000)
     wide = synth.Star(160.3, 128.2, 1.0, 20000)
     raw = synth.frame(stars=[small, wide], hot=[(128, 104, 30000)])
@@ -63,8 +68,8 @@ def test_one_pixel_star_survives_hot_pixel_fix_and_pick():
     r_wide = measure_star(gray, wide.x, wide.y, sigma)
     assert r_small is not None and r_wide is not None
     assert r_small.size < r_wide.size
-    assert r_small.size == pytest.approx(2.158, abs=0.005)
-    assert r_wide.size == pytest.approx(2.918, abs=0.005)
+    assert r_small.size == pytest.approx(2.031, abs=0.005)
+    assert r_wide.size == pytest.approx(2.840, abs=0.005)
 
 
 def test_hot_pixel_removed_not_counted_as_star():
@@ -113,6 +118,16 @@ def test_to_gray_mono_passes_through_and_bayer_is_full_resolution():
         to_gray(raw, 'XYZW')
 
 
+def test_to_gray_follows_repo_bayer_convention():
+    """constants.py CFA_* mapping: a pure-red field must weigh as red (0.299), not blue (0.114)."""
+    level = 10000
+    for pattern, red_site in (('RGGB', (0, 0)), ('GRBG', (0, 1)), ('GBRG', (1, 0)), ('BGGR', (1, 1))):
+        raw = np.zeros((32, 32), np.uint16)
+        raw[red_site[0]::2, red_site[1]::2] = level
+        g = float(np.median(to_gray(raw, pattern)[4:-4, 4:-4]))
+        assert g == pytest.approx(0.299 * level, rel=0.02), pattern
+
+
 def test_noise_sigma_matches_gaussian():
     rng = np.random.default_rng(1)
     g = rng.normal(500.0, 20.0, (512, 512)).astype(np.float32)
@@ -138,8 +153,8 @@ def test_pick_rejects_glint_edge_and_split():
     shape = (256, 256)
     glint = synth.Glint(190.0, 190.0, math.sqrt(1200 / math.pi), 20000)
     edge = synth.Star(10.3, 128.2, 1.0, 20000)       # 10 px from the left edge
-    bright = synth.Star(80.3, 80.2, 0.5, 1200)
-    faint = synth.Star(85.3, 80.2, 0.5, 800)          # 5 px from the bright star
+    bright = synth.Star(80.3, 80.2, 0.5, 1600)
+    faint = synth.Star(85.3, 80.2, 0.5, 1000)         # 5 px from the bright star
     control = synth.Star(128.3, 60.2, 1.0, 20000)
     raw = synth.frame(shape=shape, stars=[edge, bright, faint, control], glints=[glint])
     gray, _ = _clean_gray(raw)
@@ -166,9 +181,9 @@ def test_peak_snr_uses_central_7x7():
     """Pure noise: the typical box reads under 4, and the central 7x7 reads lower than the whole 25x25 box would.
 
     Not every noise box reads under 4. On Bayer gray, noise_sigma's every-4th-pixel sample lands on one Bayer site,
-    the quietest (std 11.3 there vs 17.0 over all pixels on this synth), so the S/N of a pure-noise box reaches 4
-    in about a quarter of boxes (24.5% of 1369 on a 512x512 frame; median 3.3). On a mono frame the median is 2.2.
-    That is the prototype's behaviour, kept; see the task 5 report.
+    the red one (std 13.8 there vs 17.0 over all pixels on this synth), so the S/N of a pure-noise box reaches 4
+    in about one box in nine (11.7% of 1369 on a 512x512 frame; median 3.0). On a mono frame the median is 2.2.
+    That sampling is the prototype's, kept by ruling; see the task 5 report.
     """
     gray = to_gray(synth.frame(shape=(256, 256)), 'RGGB')
     sigma = noise_sigma(gray)
