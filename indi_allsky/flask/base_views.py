@@ -309,6 +309,8 @@ class BaseView(View):
             data['status'] = '<span class="tw:text-primary">STOPPED</span>'
         elif status == constants.STATUS_PAUSED:
             data['status'] = '<span class="tw:text-base-content/60">PAUSED</span>'
+        elif status == constants.STATUS_FOCUSING:
+            data['status'] = '<span class="tw:text-info">FOCUSING</span>'
         elif status == constants.STATUS_NOCAMERA:
             data['status'] = '<span class="tw:text-error">NO CAMERA</span>'
         elif status == constants.STATUS_CAMERAERROR:

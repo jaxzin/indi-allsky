@@ -84,6 +84,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from indi_allsky import constants
 from indi_allsky.focus.exposure_search import FOUND_STARS
 from indi_allsky.focus.exposure_search import MSG_NO_STARS
 from indi_allsky.focus.exposure_search import ExposureSearch
@@ -146,6 +147,10 @@ MSG_LOST = 'None of the picked stars is in this picture.'
 MSG_PREVIEW_FAILED = 'Could not take a whole-sensor picture.'
 MSG_PREVIEW_BUSY = 'A whole-sensor picture is already on its way.'
 MSG_SATURATED = 'The picked stars are saturated. Try a shorter exposure.'
+MSG_START_FAILED = 'The focus session could not start.'
+
+SESSION_TURN_S = 0.05         # capture's loop sleep while a session runs, and per wait-loop turn
+STATUS_EVERY_S = 1.0          # WATCHDOG and STATUS writes during a session, at most this often
 
 OPEN_COMMANDS = ('ping', 'hello')
 
@@ -934,7 +939,10 @@ class FocusService(object):
         self._on_end = on_end
         self.controller = None
         self.idle_reason = None
+        self.status_at = None     # when run_session_pass last wrote WATCHDOG and STATUS
+        self.ended_unreported = False  # a session ended and capture has not written STATUS_RUNNING yet
         self._known = set()
+        self._start_attempted = False
 
     @property
     def active(self) -> bool:
@@ -959,7 +967,13 @@ class FocusService(object):
                 if not hello or hello.get('controls') is not True:
                     self._error(cid, kind, MSG_CONTROLS)
                     continue
-                controller = self._make(cid)
+                self._start_attempted = True
+                try:
+                    controller = self._make(cid)
+                except Exception:
+                    logger.exception('Focus: the session could not be set up')
+                    self._error(cid, kind, MSG_START_FAILED)
+                    continue
                 self.controller = controller
                 controller.begin(cid)
                 started = controller.active  # False when the source failed to start
@@ -977,12 +991,30 @@ class FocusService(object):
             self._known = now
         return started
 
+    def take_start_attempt(self) -> bool:
+        """True once after a page with controls asked to start, whether or not the session started: capture
+        leaves its wait either way, because making the controller may already have aborted the exposure."""
+        attempted, self._start_attempted = self._start_attempted, False
+        return attempted
+
+    def stop(self, reason: str) -> None:
+        """End the session, if one runs, and put the camera back (capture shutdown, reload, a failure)."""
+        controller = self.controller
+        if controller is not None:
+            try:
+                controller.end(reason)
+            except Exception:
+                logger.exception('Focus: ending the session failed')
+                controller._active = False
+        self._reap()
+
     def _reap(self):
         controller = self.controller
         if controller is None or controller.active:
             return
         self.controller = None
         self.idle_reason = controller.end_reason
+        self.ended_unreported = True
         if self._on_end is not None:
             try:
                 self._on_end(controller)
@@ -1008,3 +1040,79 @@ class FocusService(object):
     def _error(self, cid, command, message):
         self.link.send_json(cid, {'kind': 'error', 'message': message,
                                   'command': command if isinstance(command, str) else None})
+
+
+# -- the capture loop --------------------------------------------------------------------------------------------------
+# capture.py cannot be imported without PyIndi, so the session's part of its loop lives here.
+
+def _safe_poll(service) -> None:
+    """A focus failure ends the session; it never reaches the capture loop."""
+    try:
+        service.poll()
+    except Exception:
+        logger.exception('Focus: the session failed')
+        try:
+            service.stop('failed')
+        except Exception:
+            logger.exception('Focus: ending the failed session failed')
+
+
+def run_session_pass(worker, *, sleep: Callable[[float], None] = time.sleep,
+                     epoch: Callable[[], float] = time.time,
+                     clock: Callable[[], float] = time.monotonic) -> bool:
+    """One pass of capture's main loop for the focus session. True when capture must skip its normal schedule this
+    pass: a session runs, or one just started or ended (the camera was aborted or reconfigured).
+
+    worker: `focus` (a FocusService or None), `_shutdown`, `_miscDb`. While a session runs it writes WATCHDOG and
+    STATUS_FOCUSING (at most every STATUS_EVERY_S, not 20 times a second) and sleeps SESSION_TURN_S. A shutdown, reload
+    or interrupt ends the session as 'stopped'. When a session ends it writes STATUS_RUNNING back.
+    """
+    service = getattr(worker, 'focus', None)
+    if service is None:
+        return False
+    was_active = service.active
+    _safe_poll(service)
+    if service.active and worker._shutdown:
+        service.stop('stopped')
+    attempted = service.take_start_attempt()
+
+    if service.active:
+        now = clock()
+        if service.status_at is None or now - service.status_at >= STATUS_EVERY_S:
+            service.status_at = now
+            worker._miscDb.setState('WATCHDOG', int(epoch()))
+            worker._miscDb.setState('STATUS', constants.STATUS_FOCUSING)
+        sleep(SESSION_TURN_S)
+        return True
+
+    service.status_at = None
+    if service.ended_unreported:
+        service.ended_unreported = False
+        worker._miscDb.setState('STATUS', constants.STATUS_RUNNING)
+        return True
+    return was_active or attempted
+
+
+def focus_wait_turn(worker, *, sleep: Callable[[float], None] = time.sleep) -> bool:
+    """One turn of capture's wait for an exposure: sleep SESSION_TURN_S, then read the link. True when a page asked
+    to start a session, so capture leaves the wait at once instead of after the exposure."""
+    sleep(SESSION_TURN_S)
+    service = getattr(worker, 'focus', None)
+    if service is None:
+        return False
+    _safe_poll(service)
+    return service.take_start_attempt() or service.active
+
+
+def focus_sleep(worker, seconds: float, *, sleep: Callable[[float], None] = time.sleep,
+                clock: Callable[[], float] = time.monotonic) -> bool:
+    """Capture's long sleeps (paused, daytime) in SESSION_TURN_S turns, so pages are answered meanwhile. Returns
+    True, early, when a page asked to start a session."""
+    if getattr(worker, 'focus', None) is None:
+        sleep(seconds)
+        return False
+    end = clock() + seconds
+    while clock() < end:
+        if focus_wait_turn(worker, sleep=sleep):
+            return True
+    return False

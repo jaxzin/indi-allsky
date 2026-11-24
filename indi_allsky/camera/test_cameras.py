@@ -5,6 +5,7 @@ from pathlib import Path
 import math
 import random
 import tempfile
+import threading
 import logging
 
 from .indi import IndiClient
@@ -168,6 +169,89 @@ class IndiClientTestCameraBase(IndiClient):
             self._queueImage()
 
 
+    # -- video for a focus session ------------------------------------------------------------------------------
+    # Simulated focus: 0 is in focus, and blur grows with abs(sim_position). It stays 0 until a simulated focuser
+    # drives it.
+    sim_position = 0
+    SIM_BLUR_PER_STEP = 8.0  # sim_position steps per pixel of blur sigma
+
+    def has_video(self):
+        return True
+
+
+    def start_video(self, exposure, roi):
+        """Render a frame every `exposure` seconds and hand `roi` (x, y, w, h; None for the whole picture) of it
+        to `blob_sink` as 16-bit little-endian mono, like a driver's RAW stream."""
+        self.stop_video()
+
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=self._video_loop,
+            args=(stop, float(exposure), roi),
+            name='test-camera-video',
+            daemon=True,
+        )
+        self._video = (stop, thread)
+        thread.start()
+
+
+    def stop_video(self):
+        video = getattr(self, '_video', None)
+        if video is None:
+            return
+
+        self._video = None
+
+        stop, thread = video
+        stop.set()
+        if thread is not threading.current_thread():
+            thread.join(5.0)
+
+
+    def _video_loop(self, stop, exposure, roi):
+        while not stop.is_set():
+            started = time.time()
+
+            try:
+                data = self._video_frame(roi)
+            except Exception:
+                logger.exception('Test camera: rendering a video frame failed')
+                return
+
+            remaining = exposure - (time.time() - started)
+            if remaining > 0 and stop.wait(remaining):
+                return
+
+            sink = self.blob_sink
+            if sink is not None and not stop.is_set():
+                sink(data, '.stream', time.time())
+
+
+    def _video_frame(self, roi):
+        import numpy
+        import cv2
+
+        self.updateImage(1)
+
+        image = self._image
+        if image.ndim == 3:
+            image = image.mean(axis=2)
+
+        if roi is not None:
+            x, y, w, h = (int(v) for v in roi)
+            image = image[y:y + h, x:x + w]
+
+        image = numpy.ascontiguousarray(image, dtype=numpy.float32)
+
+        sigma = abs(float(self.sim_position)) / self.SIM_BLUR_PER_STEP
+        if sigma > 0:
+            image = cv2.GaussianBlur(image, (0, 0), sigma)
+
+        frame = numpy.clip(image, 0, 65535).astype('<u2')
+
+        return frame.tobytes()
+
+
     def getCcdExposureStatus(self):
         if self.active_exposure:
             if time.time() - self.exposureStartTime < self.exposure:
@@ -188,6 +272,9 @@ class IndiClientTestCameraBase(IndiClient):
 
         self.active_exposure = False
 
+
+        if self.current_exposure_file_p is None:
+            return  # nothing exposed yet
 
         try:
             self.current_exposure_file_p.unlink()

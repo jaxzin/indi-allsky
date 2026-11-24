@@ -23,6 +23,15 @@ import queue
 from . import constants
 from . import camera as camera_module
 
+from .focus.capture_session import DEFAULT_ADDRESS as FOCUS_DEFAULT_ADDRESS
+from .focus.capture_session import FocusGlue
+from .focus.capture_session import open_link as focus_open_link
+from .focus.capture_session import state_path_for as focus_state_path_for
+from .focus.controller import focus_sleep
+from .focus.controller import focus_wait_turn
+from .focus.controller import run_session_pass
+from .focus.indi_stream import focus_startup_restore
+
 from .utils import IndiAllSkyDateCalcs
 from .utils import IndiAllSkyExposureUtils
 
@@ -296,6 +305,12 @@ class CaptureWorker(Process):
 
         self._shutdown = False
 
+        # live focus session (indi_allsky/focus): the page's link and the service; None when the link is unavailable
+        self.focus_link = None
+        self.focus = None
+        self._focus_ccd_info = None
+        self._focus_cfa = None
+
 
 
     def sighup_handler_worker(self, signum, frame):
@@ -342,6 +357,13 @@ class CaptureWorker(Process):
 
 
     def saferun(self):
+        try:
+            self._saferun()
+        finally:
+            self._focus_close()
+
+
+    def _saferun(self):
         #raise Exception('Test exception handling in worker')
 
 
@@ -355,6 +377,8 @@ class CaptureWorker(Process):
 
         with app.app_context():
             self._initialize()
+
+            self._focus_open()
 
             self._pre_run_tasks()
 
@@ -387,8 +411,9 @@ class CaptureWorker(Process):
             loop_start_time = time.time()
 
 
-            logger.info('Camera last ready: %0.1fs', loop_start_time - camera_ready_time)
-            logger.info('Exposure state: %s', exposure_state)
+            if not (self.focus and self.focus.active):
+                logger.info('Camera last ready: %0.1fs', loop_start_time - camera_ready_time)
+                logger.info('Exposure state: %s', exposure_state)
 
 
             if self.indiclient.disconnected:
@@ -416,6 +441,16 @@ class CaptureWorker(Process):
 
             except queue.Empty:
                 pass
+
+
+            # a live focus session runs instead of the normal schedule
+            with app.app_context():
+                focus_busy = run_session_pass(self)
+
+            if focus_busy:
+                exposure_aborted = True  # a session aborted or replaced the exposure
+                camera_ready_time = time.time()
+                continue
 
 
             self.detectNight()
@@ -548,7 +583,7 @@ class CaptureWorker(Process):
                         return
 
 
-                    time.sleep(31)  # prime number
+                    focus_sleep(self, 31)  # prime number; a focus session start ends the wait
                     continue
 
                 elif not self.night and not self.config.get('DAYTIME_CAPTURE'):
@@ -569,7 +604,7 @@ class CaptureWorker(Process):
                         return
 
 
-                    time.sleep(31)  # prime number
+                    focus_sleep(self, 31)  # prime number; a focus session start ends the wait
                     continue
 
 
@@ -594,7 +629,10 @@ class CaptureWorker(Process):
                 loop_end = time.time() + 11
 
                 while True:
-                    time.sleep(0.05)
+                    if focus_wait_turn(self):  # sleeps 0.05s
+                        # a page started a focus session: do not wait for this exposure
+                        exposure_aborted = True
+                        break
 
                     now_time = time.time()
                     if now_time >= loop_end:
@@ -993,6 +1031,9 @@ class CaptureWorker(Process):
             cfa_pattern = self.config['CFA_PATTERN']
         else:
             cfa_pattern = ccd_info['CCD_CFA']['CFA_TYPE'].get('text')
+
+        self._focus_ccd_info = ccd_info
+        self._focus_cfa = cfa_pattern
 
 
         # populate S3 data
@@ -1959,6 +2000,65 @@ class CaptureWorker(Process):
         self.indiclient.unparkTelescope()
         self.indiclient.setTelescopeParkPosition(0.0, self.position_av[constants.POSITION_LATITUDE])
         self.indiclient.parkTelescope()
+
+
+    def _focus_open(self):
+        """After the camera is up: put back what a focus session left (if capture died in one), then listen for
+        the focus page. Without the link, capture runs as before."""
+        address = app.config.get('INDI_ALLSKY_FOCUS_ADDRESS', FOCUS_DEFAULT_ADDRESS)
+        state_path = focus_state_path_for(address)
+
+        focus_startup_restore(self.indiclient, state_path)
+
+        self.focus_link = focus_open_link(address)
+        if not self.focus_link:
+            return
+
+        try:
+            glue = FocusGlue(
+                self.indiclient,
+                self.focus_link,
+                camera_interface=self.config.get('CAMERA_INTERFACE', 'indi'),
+                device_name=self.indiclient.ccd_device.getDeviceName(),
+                ccd_info=self._focus_ccd_info,
+                cfa=self._focus_cfa,
+                gain=lambda: max(0.0, float(getattr(self.indiclient, 'gain', 0) or 0)),
+                state_path=state_path,
+                reconfigure=self._focus_reconfigure,
+            )
+        except Exception:
+            logger.exception('Focus: the live focus service could not be set up')
+            self._focus_close()
+            return
+
+        self.focus = glue.service
+
+
+    def _focus_reconfigure(self):
+        """After a session: the normal settings go back on the camera before the next exposure."""
+        self.reconfigure_camera = True
+
+        if not self._shutdown and self.focus is not None:  # not while capture stops (_focus_close)
+            self.reconfigureCcd()
+
+
+    def _focus_close(self):
+        focus, link = self.focus, self.focus_link
+        self.focus = None
+        self.focus_link = None
+
+        if focus is not None:
+            try:
+                with app.app_context():
+                    focus.stop('stopped')
+            except Exception:
+                logger.exception('Focus: ending the session at shutdown failed')
+
+        if link is not None:
+            try:
+                link.close()
+            except Exception:
+                logger.exception('Focus: closing the live focus link failed')
 
 
     def reconfigureCcd(self):

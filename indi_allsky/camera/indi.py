@@ -34,6 +34,9 @@ app = create_app()
 
 class IndiClient(PyIndi.BaseClient):
 
+    # set by a focus session: called with (data, format, time) for every picture, instead of the image queue
+    blob_sink = None
+
     __state_to_str_p = {
         PyIndi.IPS_IDLE  : 'IDLE',
         PyIndi.IPS_OK    : 'OK',
@@ -373,6 +376,19 @@ class IndiClient(PyIndi.BaseClient):
 
 
     def processBlob(self, blob):
+        sink = self.blob_sink
+        if sink is not None:
+            # a focus session takes every picture (video frames and stills) instead of the image queue
+            try:
+                sink(blob.getblobdata(), self._blob_format(blob), time.time())
+            except Exception:
+                logger.exception('Focus: a picture could not be taken by the session')
+            return
+
+        if self._blob_format(blob).startswith('.stream'):
+            # a video frame still on its way after a focus session ended
+            return
+
         from astropy.io import fits
 
         exposure_elapsed_s = time.time() - self.exposureStartTime
@@ -1539,6 +1555,30 @@ class IndiClient(PyIndi.BaseClient):
             self.__wait_for_ctl_statuses(c, timeout=timeout)
 
         return c
+
+
+    @staticmethod
+    def _blob_format(blob):
+        getter = getattr(blob, 'getFormat', None)
+        fmt = getter() if callable(getter) else getattr(blob, 'format', '')
+        return str(fmt or '')
+
+
+    def has_video(self):
+        """True when the camera's driver offers a video stream (CCD_VIDEO_STREAM)."""
+        getter = getattr(self.ccd_device, 'getSwitch', None)
+        if not callable(getter):
+            return False
+
+        prop = getter('CCD_VIDEO_STREAM')
+        if prop is None:
+            return False
+
+        is_valid = getattr(prop, 'isValid', None)
+        if callable(is_valid):
+            return bool(is_valid())
+
+        return bool(prop)
 
 
     def set_switch(self, device, name, on_switches=[], off_switches=[], sync=True, timeout=None):
