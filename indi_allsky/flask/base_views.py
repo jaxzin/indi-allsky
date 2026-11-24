@@ -156,6 +156,10 @@ class BaseView(View):
                 continue
 
             for addr in addr_info:
+                if addr.family == socket.AF_INET and addr.netmask is None:
+                    # point-to-point/tunnel interfaces (macOS utun) may report no netmask
+                    continue
+
                 if addr.family == socket.AF_INET:
                     cidr = ipaddress.IPv4Network('0.0.0.0/{0:s}'.format(addr.netmask)).prefixlen
                     network_list.append('{0:s}/{1:d}'.format(addr.address, cidr))

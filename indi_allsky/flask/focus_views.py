@@ -34,10 +34,14 @@ from ..focus.link import SlotOverflow
 LINK_UNREACHABLE_REASON = ('The live focus page cannot reach the capture program. It may be stopped, or running in '
                            'another container or on another machine.')
 
-PAGE_MSG_MAX = 4096       # bytes, UTF-8; larger page messages are dropped
+# `ended` reason when the page reads too slowly and its JSON queue fills (a code, like the controller's reasons).
+SLOW_REASON = 'slow'
+
+PAGE_MSG_MAX = 4096      # bytes, UTF-8; larger page messages are dropped
 WS_MSG_MAX = 64 * 1024    # simple_websocket closes the connection over this
 POLL_S = 0.5              # every blocking wait wakes at least this often to check for shutdown
 JOIN_TIMEOUT_S = 2.0
+FLUSH_TIMEOUT_S = 2.0     # how long a too-slow page gets to take its final `ended`
 
 # Messages after which capture sends nothing more to this page.
 _FINAL_KINDS = ('ended', 'refused')
@@ -66,6 +70,7 @@ class FocusRelay(object):
         self.slot = NewestSlot()
         self._stop = threading.Event()       # any side asks for teardown
         self._link_done = threading.Event()  # the reader will put nothing more in the slot
+        self._sender_done = threading.Event()
 
     def run(self):
         reader = threading.Thread(target=self._link_reader, name='focus-ws-link', daemon=True)
@@ -91,6 +96,7 @@ class FocusRelay(object):
 
     def _link_reader(self):
         final_seen = False
+        slow = False
         try:
             while not self._stop.is_set():
                 msg = self.link.recv(timeout=POLL_S)
@@ -107,7 +113,12 @@ class FocusRelay(object):
             pass
         except SlotOverflow:
             self.logger.warning('Focus page too slow to keep up; closing it')
-            self._stop.set()
+            # Throw away what it has not read, and tell it why it is being closed.
+            while self.slot.get(timeout=0) is not None:
+                pass
+            self.slot.put_json(_encode({'kind': 'ended', 'reason': SLOW_REASON}).encode('utf-8'))
+            final_seen = True
+            slow = True
         except Exception as e:
             self.logger.error('Focus page link reader failed: %s', type(e).__name__)
             self._stop.set()
@@ -119,6 +130,10 @@ class FocusRelay(object):
                 except SlotOverflow:
                     pass
             self._link_done.set()
+            if slow:
+                # The sender stops by itself once the slot is empty; a page that will not take even this is cut off.
+                self._sender_done.wait(FLUSH_TIMEOUT_S)
+                self._stop.set()
 
     # -- slot -> page -------------------------------------------------------------
 
@@ -141,6 +156,7 @@ class FocusRelay(object):
             self.logger.error('Focus page send failed: %s', type(e).__name__)
         finally:
             self._stop.set()
+            self._sender_done.set()
             # Wakes nothing by itself (the page reader polls), but tells the browser the session is over.
             self._close_ws()
 
@@ -175,7 +191,7 @@ class FocusRelay(object):
             return None
         try:
             command = json.loads(message)
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: deep nesting, on Python 3.9's scanner
             self.logger.debug('Focus page message dropped: not JSON')
             return None
         if not isinstance(command, dict):

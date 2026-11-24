@@ -8,12 +8,15 @@ is the real `BaseView.verify_admin_network()`, fed by the request's remote addre
 
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import queue
+import socket
 import sys
 import threading
 import time
+import types
 from unittest import mock
 
 import pytest
@@ -409,3 +412,84 @@ def test_no_message_body_in_logs(web, server, caplog):
 
     assert any('Focus page' in r.getMessage() for r in caplog.records), 'the relay logged nothing; test is vacuous'
     assert SECRET not in caplog.text
+
+
+def test_deeply_nested_page_message_is_dropped(web, server, monkeypatch):
+    # Under 4096 bytes, but Python 3.9's json scanner raises RecursionError on it (3.13's parses it). The patched
+    # loads does what 3.9 does, so this holds on every Python.
+    nested = '[' * 2048 + ']' * 2048
+    real_json = web.focus_views.json
+
+    def loads(s, *args, **kwargs):
+        if s == nested:
+            raise RecursionError('maximum recursion depth exceeded while decoding a JSON array')
+        return real_json.loads(s, *args, **kwargs)
+
+    monkeypatch.setattr(web.focus_views, 'json', types.SimpleNamespace(loads=loads, dumps=real_json.dumps))
+
+    t, ws, result = web.open_page()
+    cid = _one_client(server)
+    ws.page_sends(nested)
+    ws.page_sends(json.dumps({'kind': 'ping', 'id': 2}))
+    assert _commands(server, 1) == [(cid, {'kind': 'ping', 'id': 2})]
+    assert t.is_alive()
+    assert 'status' not in result
+
+
+def test_slow_page_gets_ended_slow_then_closes(web, server, monkeypatch):
+    overflowed = threading.Event()
+    real_slot = web.focus_views.NewestSlot
+
+    class SmallSlot(real_slot):
+        def __init__(self):
+            super(SmallSlot, self).__init__(json_cap=2)
+
+        def put_json(self, payload):
+            try:
+                super(SmallSlot, self).put_json(payload)
+            except web.focus_views.SlotOverflow:
+                overflowed.set()
+                raise
+
+    monkeypatch.setattr(web.focus_views, 'NewestSlot', SmallSlot)
+
+    t, ws, _ = web.open_page()
+    _one_client(server)
+
+    first_in_flight = threading.Event()
+    release = threading.Event()
+
+    def gate(data):
+        if isinstance(data, str) and '"n":0' in data:
+            first_in_flight.set()
+            release.wait(WAIT_S)
+
+    ws.gate = gate
+    server.broadcast_json({'kind': 'reading', 'n': 0})
+    assert first_in_flight.wait(WAIT_S)
+    for n in range(1, 6):
+        server.broadcast_json({'kind': 'reading', 'n': n})
+    assert overflowed.wait(WAIT_S)
+    release.set()
+
+    t.join(WAIT_S)
+    assert not t.is_alive()
+    assert ws.json_sent() == [{'kind': 'reading', 'n': 0}, {'kind': 'ended', 'reason': 'slow'}]
+    assert ws.closed.is_set()
+
+
+def test_admin_network_check_skips_addresses_without_netmask(web, monkeypatch):
+    # Pre-existing BaseView code: macOS utun (and some tunnel) addresses report netmask None.
+    from indi_allsky.flask import base_views
+
+    addr = collections.namedtuple('snicaddr', 'family address netmask broadcast ptp')
+    monkeypatch.setattr(base_views.psutil, 'net_if_addrs', lambda: {
+        'utun0': [addr(socket.AF_INET, '100.101.102.103', None, None, '100.101.102.103')],
+        'en0': [addr(socket.AF_INET, '192.168.5.10', '255.255.255.0', None, None)],
+    })
+    view = base_views.BaseView()
+
+    with web.app.test_request_context('/', environ_base={'REMOTE_ADDR': '192.168.5.20'}):
+        assert view.verify_admin_network() is True
+    with web.app.test_request_context('/', environ_base={'REMOTE_ADDR': OUTSIDE_IP}):
+        assert view.verify_admin_network() is False
