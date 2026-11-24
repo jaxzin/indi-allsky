@@ -43,20 +43,6 @@ def _wait(pred, timeout=WAIT_S):
     return pred()
 
 
-class FakeUser(object):
-    is_active = True
-    is_anonymous = False
-    is_authenticated = True
-    data = {}
-    username = 'tester'
-
-    def __init__(self, is_admin):
-        self.is_admin = is_admin
-
-    def get_id(self):
-        return '1'
-
-
 class FakeWs(object):
     """Stands in for `simple_websocket.Server`: `receive`, `send`, `close`."""
 
@@ -107,44 +93,12 @@ class FakeWs(object):
 
 
 @pytest.fixture
-def web(tmp_path, sock_path, monkeypatch):
-    """The real app, with the fakes described in the module docstring. Returns a namespace of helpers."""
-    pytest.importorskip('flask')
-    pytest.importorskip('flask_login')
-    simple_websocket = pytest.importorskip('simple_websocket')
-
-    # dbus-python and systemd-python do not build off Linux; the views import them at module level.
-    for name in ('dbus', 'systemd', 'systemd.journal'):
-        try:
-            __import__(name)
-        except ImportError:
-            monkeypatch.setitem(sys.modules, name, mock.MagicMock())
-
-    flask_json = tmp_path / 'flask.json'
-    flask_json.write_text(json.dumps({
-        'SQLALCHEMY_DATABASE_URI': 'sqlite:///' + str(tmp_path / 'test.sqlite'),
-        'SQLALCHEMY_TRACK_MODIFICATIONS': False,
-        'MIGRATION_FOLDER': str(tmp_path / 'migrations'),
-        'SECRET_KEY': 'test-secret-key',
-        'PASSWORD_KEY': 'test-password-key',
-        'LOGIN_DISABLED': False,
-        'ADMIN_NETWORKS': ['127.0.0.1/32'],
-        'INDI_ALLSKY_FOCUS_ADDRESS': sock_path,
-    }))
-    monkeypatch.setenv('INDI_ALLSKY_FLASK_CONFIG', str(flask_json))
-
-    from flask.views import View
-    from indi_allsky.flask import create_app
-    from indi_allsky.flask import base_views
+def web(flask_app, simple_websocket, monkeypatch):
+    """The real app (see `flask_app`) with a fake websocket. Returns a namespace of helpers."""
     from indi_allsky.flask import focus_views
 
-    monkeypatch.setattr(base_views.BaseView, '__init__', lambda self, **kw: View.__init__(self))
-    # The admin check also trusts this host's own interface networks; give it none so ADMIN_NETWORKS alone decides.
-    monkeypatch.setattr(base_views.psutil, 'net_if_addrs', lambda: {})
-
-    app = create_app()
-    user = {'value': FakeUser(is_admin=False)}
-    app.login_manager.request_loader(lambda request: user['value'])
+    app = flask_app.app
+    set_user = flask_app.set_user
 
     sockets = []
 
@@ -163,9 +117,6 @@ def web(tmp_path, sock_path, monkeypatch):
     w.focus_views = focus_views
     w.sockets = sockets
     w.threads = []
-
-    def set_user(is_admin):
-        user['value'] = FakeUser(is_admin=is_admin)
 
     def open_page(remote_addr=OUTSIDE_IP, headers=None):
         """Start a /ws/focus request on a thread; return (thread, fake ws, result dict)."""

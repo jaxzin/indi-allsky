@@ -135,6 +135,10 @@ from .youtube_views import YoutubeRefreshAuthView
 from .youtube_views import YoutubeRevokeAuthView
 
 from .focus_views import WsFocusView
+from .focus_views import focus_address
+
+from ..focus.link import probe as focus_link_probe
+from ..focus.rigs import decide
 
 from ..exceptions import ConfigSaveException
 from ..exceptions import NotFound
@@ -7510,7 +7514,40 @@ class FocusView(TemplateView):
         context['focuser_device'] = int(bool(self.indi_allsky_config.get('FOCUSER', {}).get('CLASSNAME')))
         context['form_focuscontroller'] = IndiAllskyFocusControllerForm()
 
+
+        # whether the driver offers video comes from the capture side's `state` message, so it is not known here
+        decision = decide(
+            self.indi_allsky_config.get('CAMERA_INTERFACE', 'indi'),
+            self.camera.name,
+            None,
+            focus_link_probe(focus_address()),
+        )
+
+        ws_url = url_for('indi_allsky.ws_focus_view', _external=True)
+        if ws_url.startswith('https://'):
+            ws_url = 'wss://' + ws_url[8:]
+        elif ws_url.startswith('http://'):
+            ws_url = 'ws://' + ws_url[7:]
+
+        context['focus_decision'] = decision
+        context['focus_reason'] = decision.reason
+        # same rule as /ws/focus
+        context['can_start'] = bool(current_user.is_authenticated and current_user.is_admin and self.verify_admin_network())
+        context['motor_configured'] = bool(self.indi_allsky_config.get('FOCUSER', {}).get('CLASSNAME'))
+        context['focus_ws_url'] = ws_url
+
         return context
+
+
+    def dispatch_request(self):
+        context = self.get_context()
+
+        if context['focus_decision'].page == 'new':
+            self.template_name = 'focus_session.html'
+        else:
+            self.template_name = 'focus_classic.html'
+
+        return self.render_template(context)
 
 
 class JsonFocusView(JsonView):

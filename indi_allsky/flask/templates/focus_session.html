@@ -1,0 +1,64 @@
+{% extends 'base.html' %}
+
+{# Minimal shell of the live Focus page. The live picture and the controls are added later. #}
+{% block title %}{{ website_title }}: {{ page_title }}{% endblock %}
+
+{% block head %}
+<meta charset="UTF-8">
+<script type="text/javascript">
+var json_data = {
+    'image_b64'  : null,
+    'blur_score' : 0.0,
+    'star_count' : 0,
+    'focus_mode' : false,
+};
+var camera_id = {{ camera_id }};
+var refreshInterval = 5000;
+
+
+// Today's picture and score, from the same poll today's page uses
+function loadNextImage() {
+    $.ajax({
+        type: "GET",
+        url: "{{ url_for('indi_allsky.js_focus_view') }}",
+        contentType: "application/json",
+        data: { 'zoom' : 2, 'x_offset' : 0, 'y_offset' : 0 },
+        success: function(rdata) {
+            json_data = rdata;
+            $('#focus-score').text(json_data['blur_score'].toFixed(2));
+            $('#focus-stars').text(json_data['star_count']);
+
+            if (json_data['image_b64']) {
+                var canvas = document.getElementById("image-canvas");
+                var img = new Image();
+                img.onload = function() {
+                    canvas.setAttribute("width", this.width);
+                    canvas.setAttribute("height", this.height);
+                    canvas.getContext("2d").drawImage(this, 0, 0);
+                };
+                img.src = "data:image/jpeg;base64," + json_data['image_b64'];
+            }
+        },
+    });
+    setTimeout(loadNextImage, refreshInterval);
+}
+
+$(document).ready(function() {
+    loadNextImage();
+});
+</script>
+{% endblock %}
+
+{% block content %}
+<div id="focus-session" class="tw:p-4 tw:flex tw:flex-col tw:gap-4"
+     data-focus-session
+     data-can-start="{{ 1 if can_start else 0 }}"
+     data-motor="{{ 1 if motor_configured else 0 }}"
+     data-ws-url="{{ focus_ws_url }}">
+    {% if can_start %}
+    <div><button type="button" id="focus-start" class="tw:btn tw:btn-primary">Start</button></div>
+    {% endif %}
+    <div>Focus score <span id="focus-score">0.00</span>, stars <span id="focus-stars">0</span></div>
+    <div class="tw:overflow-auto"><canvas id="image-canvas" class="tw:block tw:max-w-full tw:h-auto"></canvas></div>
+</div>
+{% endblock %}

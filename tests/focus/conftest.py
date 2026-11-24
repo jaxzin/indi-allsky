@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import importlib
 import itertools
+import json
 import os
 import shutil
 import sys
 import tempfile
 import types
+from unittest import mock
 
 import pytest
 
@@ -123,3 +125,73 @@ def closers():
             item.close()
         except Exception:
             pass
+
+
+class FakeUser(object):
+    is_active = True
+    is_anonymous = False
+    is_authenticated = True
+    data = {}
+    username = 'tester'
+
+    def __init__(self, is_admin):
+        self.is_admin = is_admin
+
+    def get_id(self):
+        return '1'
+
+
+@pytest.fixture
+def simple_websocket():
+    return pytest.importorskip('simple_websocket')
+
+
+@pytest.fixture
+def flask_app(tmp_path, sock_path, monkeypatch):
+    """App tier: the real app from `create_app()`, built from a temp flask.json (`INDI_ALLSKY_FLASK_CONFIG`).
+
+    `BaseView.__init__` (which loads the indi-allsky config from the database) is a no-op, `psutil.net_if_addrs`
+    returns no interfaces so `ADMIN_NETWORKS` (127.0.0.1/32) alone decides the admin check, and the user comes from a
+    request loader. Returns a namespace with `app` and `set_user(is_admin)`.
+    """
+    pytest.importorskip('flask')
+    pytest.importorskip('flask_login')
+
+    # dbus-python and systemd-python do not build off Linux; the views import them at module level.
+    for name in ('dbus', 'systemd', 'systemd.journal'):
+        try:
+            __import__(name)
+        except ImportError:
+            monkeypatch.setitem(sys.modules, name, mock.MagicMock())
+
+    flask_json = tmp_path / 'flask.json'
+    flask_json.write_text(json.dumps({
+        'SQLALCHEMY_DATABASE_URI': 'sqlite:///' + str(tmp_path / 'test.sqlite'),
+        'SQLALCHEMY_TRACK_MODIFICATIONS': False,
+        'MIGRATION_FOLDER': str(tmp_path / 'migrations'),
+        'SECRET_KEY': 'test-secret-key',
+        'PASSWORD_KEY': 'test-password-key',
+        'LOGIN_DISABLED': False,
+        'ADMIN_NETWORKS': ['127.0.0.1/32'],
+        'INDI_ALLSKY_FOCUS_ADDRESS': sock_path,
+    }))
+    monkeypatch.setenv('INDI_ALLSKY_FLASK_CONFIG', str(flask_json))
+
+    from flask.views import View
+    from indi_allsky.flask import create_app
+    from indi_allsky.flask import base_views
+
+    monkeypatch.setattr(base_views.BaseView, '__init__', lambda self, **kw: View.__init__(self))
+    monkeypatch.setattr(base_views.psutil, 'net_if_addrs', lambda: {})
+
+    app = create_app()
+    user = {'value': FakeUser(is_admin=False)}
+    app.login_manager.request_loader(lambda request: user['value'])
+
+    class Env(object):
+        pass
+
+    env = Env()
+    env.app = app
+    env.set_user = lambda is_admin: user.update(value=FakeUser(is_admin=is_admin))
+    return env

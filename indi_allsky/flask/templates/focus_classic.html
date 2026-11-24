@@ -1,0 +1,9 @@
+{% extends 'focus.html' %}
+
+{# Today's Focus page, with the reason the live page is not offered. #}
+{% block content %}
+{% if focus_reason %}
+<div class="focus-reason tw:p-4 tw:pb-0" role="status">{{ focus_reason }}</div>
+{% endif %}
+{{ super() }}
+{% endblock %}
