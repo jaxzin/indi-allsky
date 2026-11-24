@@ -7,13 +7,17 @@ travel client to server.
 Wire format, both directions: one kind byte (``b'J'`` JSON, ``b'F'`` frame), a 4-byte
 big-endian payload length, then the payload. Clients may only send ``b'J'``.
 
+A connection becomes a page only when its first message, ``{'kind': 'hello'}``, arrives
+(``LinkClient.connect()`` sends it). Until then it holds no page place, has no client id
+and is not in ``clients()``; one that closes or stays silent for ``HELLO_TIMEOUT_S`` is
+dropped quietly. So ``probe()`` and the live check in ``start()`` never take a place.
+
 Message contents are never logged.
 """
 
 from __future__ import annotations
 
 import collections
-import errno
 import json
 import logging
 import os
@@ -37,20 +41,22 @@ CLIENT_JSON_MAX = 64 * 1024        # client -> server command size cap
 SERVER_MSG_MAX = 64 * 1024 * 1024  # server -> client frame/JSON size cap
 
 SEND_TIMEOUT_S = 5.0
+HELLO_TIMEOUT_S = 2.0
 PROBE_TIMEOUT_S = 0.5
 JOIN_TIMEOUT_S = 1.0
 _ACCEPT_POLL_S = 0.2
 _REFUSAL_TIMEOUT_S = 0.5
 
+HELLO = {'kind': 'hello'}
 REFUSAL = {'kind': 'refused', 'reason': 'Three pages are already watching this focus session.'}
 
 
 class LinkError(Exception):
-    pass
+    """Base class for link errors."""
 
 
 class LinkInUse(LinkError):
-    """Another live server already answers on the socket path."""
+    """Another server answers on the socket path, or it could not be verified as stale."""
 
 
 class LinkUnavailable(LinkError):
@@ -79,14 +85,14 @@ class NewestSlot(object):
     A new frame replaces any unsent frame and goes to the tail, so JSON queued before it
     is still delivered before it.
 
-    The slot does not inspect what it holds: ``LinkServer`` queues already-encoded JSON
-    bytes so a broadcast is encoded once.
+    ``put_json`` takes pre-encoded JSON bytes (UTF-8), so a broadcast is encoded once and
+    the same bytes are queued for every client. ``get`` hands them back unchanged.
     """
 
     def __init__(self, json_cap: int = 256):
         self.json_cap = json_cap
         self._cond = threading.Condition()
-        self._queue = collections.deque()  # entries: ('json', dict) or ('frame', bytes)
+        self._queue = collections.deque()  # entries: ('json', bytes) or ('frame', bytes)
         self._json_count = 0
         self._closed = False
 
@@ -101,18 +107,19 @@ class NewestSlot(object):
             self._queue.append(('frame', frame))
             self._cond.notify()
 
-    def put_json(self, obj: dict) -> None:
+    def put_json(self, payload: bytes) -> None:
+        """Queue pre-encoded JSON bytes. Raises SlotOverflow at the cap."""
         with self._cond:
             if self._closed:
                 return
             if self._json_count >= self.json_cap:
                 raise SlotOverflow('json queue full')
-            self._queue.append(('json', obj))
+            self._queue.append(('json', payload))
             self._json_count += 1
             self._cond.notify()
 
     def get(self, timeout: float | None = None):
-        """Next entry, oldest first; None on timeout or once closed."""
+        """Next ('json', bytes) or ('frame', bytes), oldest first; None on timeout or once closed."""
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
             while not self._queue and not self._closed:
@@ -139,10 +146,10 @@ class NewestSlot(object):
 
 
 class _Conn(object):
-    """One accepted client on the server side."""
+    """One accepted connection on the server side; a page once it has said hello."""
 
-    def __init__(self, cid, sock):
-        self.cid = cid
+    def __init__(self, sock):
+        self.cid = None  # assigned at registration
         self.sock = sock
         self.slot = NewestSlot()
         self.closed = threading.Event()
@@ -172,8 +179,9 @@ class LinkServer(object):
         self.path = path
         self.max_clients = max_clients
         self._lock = threading.Lock()
-        self._clients = {}   # cid -> _Conn
-        self._commands = []  # (cid, dict)
+        self._clients = {}     # cid -> _Conn, pages that have said hello
+        self._pending = set()  # _Conn not yet registered
+        self._commands = []    # (cid, dict)
         self._next_cid = 1
         self._listener = None
         self._identity = None  # (st_dev, st_ino) of the socket file we bound
@@ -216,7 +224,7 @@ class LinkServer(object):
             return
 
         if stat.S_ISDIR(st.st_mode):
-            raise IsADirectoryError(errno.EISDIR, 'Focus link path is a directory', self.path)
+            raise LinkError('socket path is a directory')
 
         if stat.S_ISSOCK(st.st_mode):
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -225,6 +233,9 @@ class LinkServer(object):
                 s.connect(self.path)
             except (ConnectionRefusedError, FileNotFoundError):
                 pass  # stale: nobody is listening
+            except OSError as e:
+                # Timeout, EACCES, ...: we could not prove it is stale, so leave it alone.
+                raise LinkInUse(self.path) from e
             else:
                 raise LinkInUse(self.path)
             finally:
@@ -251,12 +262,12 @@ class LinkServer(object):
             self._listener = None
 
         with self._lock:
-            conns = list(self._clients.values())
+            conns = list(self._clients.values()) + list(self._pending)
         for conn in conns:
             self._drop(conn, 'server closing')
         me = threading.current_thread()
         for conn in conns:
-            for t in conn.threads:
+            for t in list(conn.threads):
                 if t is not me:
                     t.join(JOIN_TIMEOUT_S)
 
@@ -313,20 +324,24 @@ class LinkServer(object):
     # -- internals ---------------------------------------------------------------
 
     def _put_json(self, conn, payload):
-        # The slot holds encoded bytes so a broadcast encodes once.
         try:
             conn.slot.put_json(payload)
         except SlotOverflow:
             self._drop(conn, 'json queue full')
 
     def _drop(self, conn, reason):
-        """Disconnect a client. Idempotent; safe from any thread."""
+        """Disconnect a connection. Idempotent; safe from any thread."""
         with self._lock:
             if conn.closed.is_set():
                 return
             conn.closed.set()
-            self._clients.pop(conn.cid, None)
-        logger.info('Focus link client %d dropped: %s', conn.cid, reason)
+            self._pending.discard(conn)
+            if conn.cid is not None:
+                self._clients.pop(conn.cid, None)
+        if conn.cid is not None:
+            logger.info('Focus link client %d dropped: %s', conn.cid, reason)
+        else:
+            logger.debug('Focus link connection closed before hello: %s', reason)
         conn.slot._close()
         try:
             conn.sock.shutdown(socket.SHUT_RDWR)
@@ -349,52 +364,62 @@ class LinkServer(object):
                 time.sleep(_ACCEPT_POLL_S)
                 continue
 
+            conn = _Conn(sock)
+            reader = threading.Thread(target=self._reader, args=(conn,), name='focus-link-read', daemon=True)
+            conn.threads = [reader]
+            conn.add_user()
             with self._lock:
-                full = len(self._clients) >= self.max_clients
-                if not full:
-                    cid = self._next_cid
-                    self._next_cid += 1
-                    conn = _Conn(cid, sock)
-                    self._clients[cid] = conn
-
-            if full:
-                self._refuse(sock)
-                continue
-
-            sock.settimeout(SEND_TIMEOUT_S)
-            reader = threading.Thread(target=self._reader, args=(conn,), name='focus-link-read-%d' % cid, daemon=True)
-            sender = threading.Thread(target=self._sender, args=(conn,), name='focus-link-send-%d' % cid, daemon=True)
-            conn.threads = [reader, sender]
-            conn.add_user()
-            conn.add_user()
-            logger.info('Focus link client %d connected', cid)
+                self._pending.add(conn)
             reader.start()
-            sender.start()
 
-    def _refuse(self, sock):
-        logger.info('Focus link refused a client: %d pages already watching', self.max_clients)
-        payload = _encode_json(REFUSAL)
-        try:
-            sock.settimeout(_REFUSAL_TIMEOUT_S)
-            sock.sendall(_header(KIND_JSON, payload) + payload)
-        except OSError:
-            pass
-        try:
-            sock.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        sock.close()
+    def _register(self, conn):
+        """Turn a connection that said hello into a page. False if it was refused."""
+        with self._lock:
+            if conn.closed.is_set():
+                return False
+            full = len(self._clients) >= self.max_clients
+            if not full:
+                self._pending.discard(conn)
+                conn.cid = self._next_cid
+                self._next_cid += 1
+                self._clients[conn.cid] = conn
 
-    def _recv_exact(self, conn, n):
-        """Read n bytes. None if the client closed or is being dropped."""
+        if full:
+            logger.info('Focus link refused a page: %d pages already watching', self.max_clients)
+            payload = _encode_json(REFUSAL)
+            try:
+                conn.sock.settimeout(_REFUSAL_TIMEOUT_S)
+                conn.sock.sendall(_header(KIND_JSON, payload) + payload)
+            except OSError:
+                pass
+            self._drop(conn, 'refused')
+            return False
+
+        conn.sock.settimeout(SEND_TIMEOUT_S)
+        sender = threading.Thread(target=self._sender, args=(conn,), name='focus-link-send-%d' % conn.cid, daemon=True)
+        conn.threads.append(sender)
+        conn.add_user()
+        threading.current_thread().name = 'focus-link-read-%d' % conn.cid
+        logger.info('Focus link client %d connected', conn.cid)
+        sender.start()
+        return True
+
+    def _recv_exact(self, conn, n, deadline=None):
+        """Read n bytes. None if the client closed, is being dropped, or missed the deadline."""
         buf = bytearray()
         while len(buf) < n:
             if conn.closed.is_set():
                 return None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                conn.sock.settimeout(remaining)
             try:
                 chunk = conn.sock.recv(n - len(buf))
             except socket.timeout:
-                # The socket's timeout exists for the sender; an idle reader keeps waiting.
+                # After hello the socket's timeout exists for the sender; an idle reader
+                # keeps waiting. Before hello the deadline check above ends the wait.
                 continue
             except OSError:
                 return None
@@ -403,36 +428,51 @@ class LinkServer(object):
             buf.extend(chunk)
         return bytes(buf)
 
+    def _read_message(self, conn, deadline=None):
+        """(obj, None) for a valid command, or (None, reason) to drop."""
+        header = self._recv_exact(conn, _HEADER.size, deadline)
+        if header is None:
+            return None, 'disconnected'
+        kind, length = _HEADER.unpack(header)
+        if kind != KIND_JSON:
+            return None, 'unexpected message kind'
+        if length > CLIENT_JSON_MAX:
+            return None, 'oversize command'
+        payload = self._recv_exact(conn, length, deadline)
+        if payload is None:
+            return None, 'disconnected'
+        try:
+            obj = json.loads(payload.decode('utf-8'))
+        except ValueError:  # includes JSONDecodeError and UnicodeDecodeError
+            return None, 'bad json'
+        if not isinstance(obj, dict):
+            return None, 'command is not an object'
+        return obj, None
+
     def _reader(self, conn):
         reason = 'disconnected'
         try:
+            obj, reason = self._read_message(conn, deadline=time.monotonic() + HELLO_TIMEOUT_S)
+            if obj is None:
+                if reason == 'disconnected':
+                    reason = 'no hello'
+                return
+            if obj.get('kind') != 'hello':
+                reason = 'first message was not hello'
+                return
+            if not self._register(conn):
+                reason = 'refused'
+                return
+
             while True:
-                header = self._recv_exact(conn, _HEADER.size)
-                if header is None:
-                    break
-                kind, length = _HEADER.unpack(header)
-                if kind != KIND_JSON:
-                    reason = 'unexpected message kind'
-                    break
-                if length > CLIENT_JSON_MAX:
-                    reason = 'oversize command'
-                    break
-                payload = self._recv_exact(conn, length)
-                if payload is None:
-                    break
-                try:
-                    obj = json.loads(payload.decode('utf-8'))
-                except ValueError:  # includes JSONDecodeError and UnicodeDecodeError
-                    reason = 'bad json'
-                    break
-                if not isinstance(obj, dict):
-                    reason = 'command is not an object'
-                    break
+                obj, reason = self._read_message(conn)
+                if obj is None:
+                    return
                 with self._lock:
                     self._commands.append((conn.cid, obj))
         except Exception:
             reason = 'reader error'
-            logger.exception('Focus link reader for client %d failed', conn.cid)
+            logger.exception('Focus link reader failed')
         finally:
             self._drop(conn, reason)
             conn.release_user()
@@ -475,6 +515,7 @@ class LinkClient(object):
         self._send_lock = threading.Lock()
 
     def connect(self) -> None:
+        """Connect and say hello. Raises LinkUnavailable(reason)."""
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
         try:
@@ -495,6 +536,11 @@ class LinkClient(object):
         self._selector = selectors.DefaultSelector()
         self._selector.register(sock, selectors.EVENT_READ)
         self._buf = bytearray()
+        try:
+            self.send(HELLO)
+        except LinkUnavailable:
+            self.close()
+            raise
 
     def send(self, obj: dict) -> None:
         if self._sock is None:
@@ -576,7 +622,7 @@ class LinkClient(object):
 
 
 def probe(path: str) -> bool:
-    """True if a server answers on path within 0.5 s. Never raises."""
+    """True if a server answers on path within 0.5 s. Never raises; never takes a page place."""
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     except OSError:

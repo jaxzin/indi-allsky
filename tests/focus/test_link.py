@@ -14,6 +14,7 @@ import pytest
 
 from indi_allsky.focus import link
 from indi_allsky.focus.link import LinkClient
+from indi_allsky.focus.link import LinkError
 from indi_allsky.focus.link import LinkInUse
 from indi_allsky.focus.link import LinkServer
 from indi_allsky.focus.link import LinkUnavailable
@@ -76,6 +77,24 @@ def raw_connect(path):
     s.settimeout(2.0)
     s.connect(path)
     return s
+
+
+def raw_message(obj):
+    payload = json.dumps(obj).encode()
+    return b'J' + struct.pack('>I', len(payload)) + payload
+
+
+def peer_closed(s, timeout=3.0):
+    """True once the server has closed s (reads until EOF)."""
+    s.settimeout(timeout)
+    try:
+        while s.recv(65536):
+            pass
+    except socket.timeout:
+        return False
+    except OSError:
+        pass
+    return True
 
 
 def recv_until(client, want, timeout=2.0):
@@ -177,9 +196,22 @@ def test_bind_refuses_directory(sock_path, closers):
     os.mkdir(sock_path)
     server = LinkServer(sock_path)
     closers.append(server)
-    with pytest.raises(OSError):
+    with pytest.raises(LinkError, match='socket path is a directory'):
         server.start()
     assert os.path.isdir(sock_path)
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason='root ignores socket file permissions')
+def test_bind_refuses_unverifiable_socket(sock_path, closers):
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dead.bind(sock_path)
+    dead.close()
+    os.chmod(sock_path, 0)  # connect now fails with EACCES, not ECONNREFUSED
+    server = LinkServer(sock_path)
+    closers.append(server)
+    with pytest.raises(LinkInUse):
+        server.start()
+    assert os.path.exists(sock_path)
 
 
 def test_bind_refuses_live_socket(sock_path, closers):
@@ -198,31 +230,31 @@ def test_bind_refuses_live_socket(sock_path, closers):
 def test_newest_only_slot_drops_old_frames_keeps_json():
     slot = NewestSlot()
     slot.put_frame(b'frame1')
-    slot.put_json({'a': 1})
+    slot.put_json(b'{"a":1}')
     slot.put_frame(b'frame2')
     slot.put_frame(b'frame3')
-    assert slot.get(0.1) == ('json', {'a': 1})
+    assert slot.get(0.1) == ('json', b'{"a":1}')
     assert slot.get(0.1) == ('frame', b'frame3')
     assert slot.get(0.05) is None
 
 
 def test_slot_keeps_json_after_frame_in_order():
     slot = NewestSlot()
-    slot.put_json({'a': 1})
+    slot.put_json(b'A')
     slot.put_frame(b'f')
-    slot.put_json({'b': 2})
-    assert slot.get(0.1) == ('json', {'a': 1})
+    slot.put_json(b'B')
+    assert slot.get(0.1) == ('json', b'A')
     assert slot.get(0.1) == ('frame', b'f')
-    assert slot.get(0.1) == ('json', {'b': 2})
+    assert slot.get(0.1) == ('json', b'B')
 
 
 def test_slot_json_cap():
     slot = NewestSlot(json_cap=256)
     for i in range(256):
-        slot.put_json({'i': i})
+        slot.put_json(b'{}')
     slot.put_frame(b'frames do not count')
     with pytest.raises(SlotOverflow):
-        slot.put_json({'i': 256})
+        slot.put_json(b'{}')
 
 
 def test_fourth_client_refused(sock_path, closers):
@@ -239,6 +271,46 @@ def test_fourth_client_refused(sock_path, closers):
         fourth.recv(2.0)
     assert exc.value.reason == 'closed'
     assert server.clients() == ids
+
+
+def test_probe_does_not_take_a_page_place(sock_path, closers):
+    server = make_server(sock_path, closers)
+    make_client(sock_path, closers)
+    make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 2)
+
+    # A probe-style connection that is still open and has not said hello.
+    lurker = raw_connect(sock_path)
+    closers.append(lurker)
+    assert probe(sock_path) is True
+
+    third = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 3)
+    server.broadcast_json({'kind': 'hi'})
+    assert third.recv(2.0) == ('json', {'kind': 'hi'})
+    assert len(server.clients()) == 3
+
+
+def test_silent_connection_dropped_quietly(sock_path, closers, monkeypatch, caplog):
+    monkeypatch.setattr(link, 'HELLO_TIMEOUT_S', 0.3)
+    server = make_server(sock_path, closers)
+    silent = raw_connect(sock_path)
+    closers.append(silent)
+    with caplog.at_level('DEBUG', logger='indi_allsky'):
+        assert peer_closed(silent)
+        assert wait_for(lambda: any('before hello' in r.getMessage() for r in caplog.records))
+    assert server.clients() == []
+    assert [r for r in caplog.records if 'before hello' in r.getMessage() and r.levelname != 'DEBUG'] == []
+
+
+def test_first_message_must_be_hello(sock_path, closers):
+    server = make_server(sock_path, closers)
+    raw = raw_connect(sock_path)
+    closers.append(raw)
+    raw.sendall(raw_message({'cmd': 'not-hello'}))
+    assert peer_closed(raw)
+    assert server.clients() == []
+    assert server.poll_commands() == []
 
 
 def test_client_ids_increase_and_are_not_reused(sock_path, closers):
@@ -304,6 +376,7 @@ def test_malformed_client_is_dropped(sock_path, closers, bad):
 
     raw = raw_connect(sock_path)
     closers.append(raw)
+    raw.sendall(raw_message({'kind': 'hello'}))
     assert wait_for(lambda: len(server.clients()) == 2)
     raw.sendall(bad)
     assert wait_for(lambda: len(server.clients()) == 1)
@@ -323,6 +396,7 @@ def test_stalled_client_dropped_at_json_cap(sock_path, closers):
     closers.append(stalled)
     stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
     stalled.connect(sock_path)
+    stalled.sendall(raw_message({'kind': 'hello'}))
     assert wait_for(lambda: len(server.clients()) == 2)
     stalled_id = [c for c in server.clients() if c != reader_id][0]
 
@@ -356,6 +430,7 @@ def test_stalled_client_dropped_at_send_timeout(sock_path, closers, monkeypatch)
     closers.append(stalled)
     stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
     stalled.connect(sock_path)
+    stalled.sendall(raw_message({'kind': 'hello'}))
     assert wait_for(lambda: len(server.clients()) == 2)
 
     frame = b'\x7f' * (8 * 1024 * 1024)
