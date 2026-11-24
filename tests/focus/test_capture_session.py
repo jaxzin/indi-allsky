@@ -39,6 +39,13 @@ class FakeMiscDb(object):
     def setState(self, key, value):
         self.states.append((key, value))
 
+    def getState(self, key):
+        # miscDb.getState: the stored value as a string; NoResultFound (here KeyError) when there is none
+        value = self.last(key)
+        if value is None:
+            raise KeyError(key)
+        return str(value)
+
     def last(self, key):
         values = [v for k, v in self.states if k == key]
         return values[-1] if values else None
@@ -272,6 +279,17 @@ def test_open_link_on_a_directory_gives_none(tmp_path):
     assert open_link(str(tmp_path)) is None
 
 
+def test_open_link_on_a_file_leaves_it_and_says_why(tmp_path, caplog):
+    path = str(tmp_path / 'notes.txt')  # a mistyped INDI_ALLSKY_FOCUS_ADDRESS
+    with open(path, 'w') as f:
+        f.write('keep me')
+    with caplog.at_level('WARNING', logger='indi_allsky'):
+        assert open_link(path) is None
+    with open(path) as f:
+        assert f.read() == 'keep me'
+    assert 'not a socket' in caplog.text
+
+
 def test_paused_sleep_ends_on_start_and_answers_pages(rig):
     page = rig.page()
     page.client.send({'kind': 'ping', 'id': 3})
@@ -429,6 +447,31 @@ def test_a_sentinel_gain_range_is_unknown(rig, gain_min, gain_max):
     limits = rig.worker.focus.controller.limits
     assert (limits['gain_min'], limits['gain_max']) == (None, None)
     rig.worker.focus.stop('done')
+
+
+def test_a_driver_without_a_gain_property_sends_no_gain_limits(rig):
+    del rig.camera.numbers['CCD_CONTROLS']  # GAIN_INFO still says 0 .. 510: the stream cannot set it all the same
+    start_session(rig)
+    limits = rig.worker.focus.controller.limits
+    assert (limits['gain_min'], limits['gain_max']) == (None, None)
+    rig.worker.focus.stop('done')
+
+
+@pytest.mark.parametrize('before', [constants.STATUS_PAUSED, constants.STATUS_SLEEPING, constants.STATUS_RUNNING])
+def test_the_status_before_the_session_comes_back_after_it(rig, before):
+    rig.worker._miscDb.setState('STATUS', before)  # capture paused, asleep for the day, or running
+    start_session(rig)
+    assert rig.worker._miscDb.last('STATUS') == constants.STATUS_FOCUSING
+    rig.worker.focus.stop('done')
+    assert run_session_pass(rig.worker) is True
+    assert rig.worker._miscDb.last('STATUS') == before
+
+
+def test_status_is_running_after_a_session_when_none_was_known(rig):
+    start_session(rig)
+    rig.worker.focus.stop('done')
+    run_session_pass(rig.worker)
+    assert rig.worker._miscDb.last('STATUS') == constants.STATUS_RUNNING
 
 
 def test_a_fixed_gain_keeps_its_limits(rig):

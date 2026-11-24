@@ -181,13 +181,21 @@ def test_socket_mode_is_0600(sock_path, closers):
     assert stat.S_IMODE(mode) == 0o600
 
 
-def test_bind_replaces_stale_socket(sock_path, closers):
-    with open(sock_path, 'w') as f:
-        f.write('stale')
-    server = make_server(sock_path, closers)
-    assert stat.S_ISSOCK(os.stat(sock_path).st_mode)
-    make_client(sock_path, closers)
-    assert wait_for(lambda: len(server.clients()) == 1)
+@pytest.mark.parametrize('kind', ['file', 'symlink'])
+def test_bind_refuses_a_path_that_is_not_a_socket_and_leaves_it(sock_path, closers, kind):
+    # a mistyped INDI_ALLSKY_FOCUS_ADDRESS must never delete someone's file
+    target = sock_path + '.data' if kind == 'symlink' else sock_path
+    with open(target, 'w') as f:
+        f.write('not mine to delete')
+    if kind == 'symlink':
+        os.symlink(target, sock_path)
+    server = LinkServer(sock_path)
+    closers.append(server)
+    with pytest.raises(LinkError, match='not a socket'):
+        server.start()
+    assert os.path.lexists(sock_path)
+    with open(target) as f:
+        assert f.read() == 'not mine to delete'
 
 
 def test_bind_replaces_dead_socket_file(sock_path, closers):

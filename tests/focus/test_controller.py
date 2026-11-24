@@ -907,3 +907,46 @@ def test_errors_carry_the_command_id(session):
     assert page.json('error', command='set_region')['cmd_id'] == 12
     ctrl.handle(page.cid, {'kind': 'set_region', 'roi': 'x', 'cmd_id': 'bad'})
     assert page.json('error', command='set_region')['cmd_id'] is None
+
+
+# -- final review ------------------------------------------------------------------------------------------------------
+
+SECRET_BODY = 'S3CRET-BODY-c0ffee'
+
+
+class GainlessSource(FakeSource):
+    """A camera whose driver has no gain property the stream can set."""
+
+    def can_set_gain(self):
+        return False
+
+
+def test_a_source_that_cannot_set_gain_sends_no_gain_limits_and_keeps_its_gain(link, connect, epoch, closers):
+    source = GainlessSource()
+    ctrl = FocusController(source, link, FakeClock(), RIG, False, epoch=epoch, exposure=1.0, gain=100.0,
+                           gain_min=0.0, gain_max=510.0)
+    closers.append(_Ender(ctrl))
+    cid, page = connect()
+    ctrl.begin(cid)
+    assert (ctrl.limits['gain_min'], ctrl.limits['gain_max']) == (None, None)
+    ctrl.handle(cid, {'kind': 'set_camera', 'exposure': 4.0, 'gain': 300, 'cmd_id': 3})
+    assert ('set_camera', 4.0, 100.0) in source.calls
+    mode = page.json('mode', exposure=4.0)
+    assert (mode['gain'], mode['gain_min'], mode['gain_max']) == (100.0, None, None)
+
+
+def test_a_command_bug_logs_the_kind_and_type_only(session, monkeypatch, caplog):
+    ctrl, page = session
+
+    def broken(cid, msg):
+        raise ValueError('page said ' + SECRET_BODY)
+
+    monkeypatch.setattr(ctrl, '_cmd_keep_going', broken)
+    with caplog.at_level('DEBUG', logger='indi_allsky'):
+        ctrl.handle(page.cid, {'kind': 'keep_going', 'note': SECRET_BODY})
+    assert page.json('error', command='keep_going')
+    warnings = [r for r in caplog.records if r.levelname == 'WARNING' and 'keep_going' in r.getMessage()]
+    assert len(warnings) == 1 and 'ValueError' in warnings[0].getMessage()
+    assert not [r for r in caplog.records if r.levelname in ('ERROR', 'CRITICAL')]
+    assert SECRET_BODY not in caplog.text
+    assert all(r.exc_info is None for r in caplog.records)

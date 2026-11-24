@@ -2008,7 +2008,7 @@ class CaptureWorker(Process):
         address = app.config.get('INDI_ALLSKY_FOCUS_ADDRESS', FOCUS_DEFAULT_ADDRESS)
         state_path = focus_state_path_for(address)
 
-        focus_startup_restore(self.indiclient, state_path)  # never raises
+        focus_startup_restore(self.indiclient, state_path, notify=self._focus_notify)  # never raises
 
         try:
             self.focus_link = focus_open_link(address)
@@ -2037,7 +2037,7 @@ class CaptureWorker(Process):
 
 
     def _focus_notify(self, key, message):
-        """A camera setting the session could not put back (runs in the session pass's app context)."""
+        """A camera setting a session could not put back (runs in the app context of the session pass or of startup)."""
         self._miscDb.addNotification(
             NotificationCategory.CAMERA,
             key,

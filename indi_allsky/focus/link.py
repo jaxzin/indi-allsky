@@ -232,20 +232,23 @@ class LinkServer(object):
         if stat.S_ISDIR(st.st_mode):
             raise LinkError('socket path is a directory')
 
-        if stat.S_ISSOCK(st.st_mode):
-            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(PROBE_TIMEOUT_S)
-            try:
-                s.connect(self.path)
-            except (ConnectionRefusedError, FileNotFoundError):
-                pass  # stale: nobody is listening
-            except OSError as e:
-                # Timeout, EACCES, ...: we could not prove it is stale, so leave it alone.
-                raise LinkInUse(self.path) from e
-            else:
-                raise LinkInUse(self.path)
-            finally:
-                s.close()
+        if not stat.S_ISSOCK(st.st_mode):
+            # A mistyped INDI_ALLSKY_FOCUS_ADDRESS could name someone's file: only a socket is ever removed.
+            raise LinkError('socket path is not a socket; it is left alone (check INDI_ALLSKY_FOCUS_ADDRESS)')
+
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(PROBE_TIMEOUT_S)
+        try:
+            s.connect(self.path)
+        except (ConnectionRefusedError, FileNotFoundError):
+            pass  # stale: nobody is listening
+        except OSError as e:
+            # Timeout, EACCES, ...: we could not prove it is stale, so leave it alone.
+            raise LinkInUse(self.path) from e
+        else:
+            raise LinkInUse(self.path)
+        finally:
+            s.close()
 
         logger.info('Focus link removing stale socket file')
         try:

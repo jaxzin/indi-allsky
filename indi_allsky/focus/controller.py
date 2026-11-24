@@ -77,6 +77,7 @@ import queue
 import statistics
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Callable
 from typing import Optional
@@ -266,8 +267,13 @@ class FocusController(object):
                  exposure_min: Optional[float] = None, exposure_max: Optional[float] = None,
                  gain_min: Optional[float] = None, gain_max: Optional[float] = None):
         """exposure_min .. gain_max: what the camera takes (None: not known). The page's controls stay inside them
-        and set_camera refuses anything outside."""
+        and set_camera refuses anything outside. A source whose `can_set_gain()` is False keeps its gain: the gain
+        limits are then None and set_camera leaves the gain as it is."""
         self.source = source
+        can_set_gain = getattr(source, 'can_set_gain', None)
+        self._gain_settable = bool(can_set_gain()) if callable(can_set_gain) else True
+        if not self._gain_settable:
+            gain_min = gain_max = None
         self.limits = {'exposure_min': exposure_min, 'exposure_max': exposure_max,
                        'gain_min': gain_min, 'gain_max': gain_max}
         self.link = link
@@ -438,10 +444,13 @@ class FocusController(object):
             handler(client_id, msg)
         except _Invalid as e:
             self._error(client_id, kind, MSG_INVALID.format(e.args[0]), echo)
-        except Exception:
+        except Exception as e:
             # a bug, not a camera fault (source errors end the session in _source_call): keep the session for
-            # every page and tell this one. The message is not logged: it is page input.
-            logger.exception('Focus: the %s command failed', kind)
+            # every page and tell this one. Only the kind and the exception type are logged: the message, and so
+            # a traceback's last line, can carry page input (spec §12). The frames go to debug, without it.
+            logger.warning('Focus: the %s command failed (%s)', kind, type(e).__name__)
+            logger.debug('Focus: where the %s command failed:\n%s', kind,
+                         ''.join(traceback.format_tb(e.__traceback__)))
             self._error(client_id, kind, MSG_COMMAND_FAILED, echo)
 
     def _cmd_ping(self, cid, msg):
@@ -463,6 +472,8 @@ class FocusController(object):
     def _cmd_set_camera(self, cid, msg):
         exposure = _num(msg.get('exposure'), 'exposure', 0.0, MAX_EXPOSURE_S, low_open=True)
         gain = _num(msg.get('gain'), 'gain', 0.0)
+        if not self._gain_settable:
+            gain = self.gain  # the camera's gain cannot be changed: never claim it was
         cmd_id = _cmd_id(msg)
         lim = self.limits
         if ((lim['exposure_min'] is not None and exposure < lim['exposure_min'])
@@ -984,7 +995,8 @@ class FocusService(object):
         self.controller = None
         self.idle_reason = None
         self.status_at = None     # when run_session_pass last wrote WATCHDOG and STATUS
-        self.ended_unreported = False  # a session ended and capture has not written STATUS_RUNNING yet
+        self.ended_unreported = False  # a session ended and capture has not written its status back yet
+        self.status_before = None      # capture's STATUS when the running session began (None: not known)
         self._known = set()
         self._start_attempted = False
 
@@ -1112,6 +1124,16 @@ def _safe_poll(service) -> None:
             logger.error('Focus: ending the failed session failed (%s)', type(e2).__name__)
 
 
+def _read_status(worker) -> Optional[int]:
+    """Capture's STATUS now, or None when there is none, it cannot be read, or it is a focus session's own."""
+    try:
+        status = int(worker._miscDb.getState('STATUS'))
+    except Exception as e:  # NoResultFound before capture wrote one, or a database error
+        logger.info('Focus: capture status not known (%s)', type(e).__name__)
+        return None
+    return None if status == constants.STATUS_FOCUSING else status
+
+
 def run_session_pass(worker, *, sleep: Callable[[float], None] = time.sleep,
                      epoch: Callable[[], float] = time.time,
                      clock: Callable[[], float] = time.monotonic) -> bool:
@@ -1120,7 +1142,8 @@ def run_session_pass(worker, *, sleep: Callable[[float], None] = time.sleep,
 
     worker: `focus` (a FocusService or None), `_shutdown`, `_miscDb`. While a session runs it writes WATCHDOG and
     STATUS_FOCUSING (at most every STATUS_EVERY_S, not 20 times a second) and sleeps SESSION_TURN_S. A shutdown, reload
-    or interrupt ends the session as 'stopped'. When a session ends it writes STATUS_RUNNING back.
+    or interrupt ends the session as 'stopped'. When a session ends it writes back the STATUS that held before it
+    (STATUS_PAUSED while capture is paused, say), or STATUS_RUNNING when that is not known.
     """
     service = getattr(worker, 'focus', None)
     if service is None:
@@ -1134,6 +1157,8 @@ def run_session_pass(worker, *, sleep: Callable[[float], None] = time.sleep,
     if service.active:
         now = clock()
         if service.status_at is None or now - service.status_at >= STATUS_EVERY_S:
+            if service.status_at is None:  # the session's first pass: STATUS is still capture's own
+                service.status_before = _read_status(worker)
             service.status_at = now
             worker._miscDb.setState('WATCHDOG', int(epoch()))
             worker._miscDb.setState('STATUS', constants.STATUS_FOCUSING)
@@ -1143,7 +1168,10 @@ def run_session_pass(worker, *, sleep: Callable[[float], None] = time.sleep,
     service.status_at = None
     if service.ended_unreported:
         service.ended_unreported = False
-        worker._miscDb.setState('STATUS', constants.STATUS_RUNNING)
+        before, service.status_before = service.status_before, None
+        if before is None:
+            before = _read_status(worker)  # a session that ended before its first pass never wrote FOCUSING
+        worker._miscDb.setState('STATUS', before if before is not None else constants.STATUS_RUNNING)
         return True
     return was_active or attempted
 

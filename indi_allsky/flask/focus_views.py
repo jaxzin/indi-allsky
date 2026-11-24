@@ -217,7 +217,13 @@ class WsFocusView(BaseView):
             logger.info('Focus page: capture link unavailable (%s)', e.reason)
             link = None
 
-        ws = simple_websocket.Server.accept(request.environ, max_message_size=WS_MSG_MAX)
+        try:
+            ws = simple_websocket.Server.accept(request.environ, max_message_size=WS_MSG_MAX)
+        except BaseException:
+            # the relay never starts, so nothing else closes the link: capture would keep a page that is not there
+            if link is not None:
+                link.close()
+            raise
 
         if link is None:
             try:

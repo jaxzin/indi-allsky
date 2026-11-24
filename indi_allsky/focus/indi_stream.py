@@ -33,18 +33,23 @@ from indi_allsky.focus.sources import snap_roi
 logger = logging.getLogger('indi_allsky')
 
 
-NUMBERS = ('CCD_CONTROLS', 'CCD_FRAME', 'CCD_BINNING', 'CCD_STREAM_FRAME', 'STREAMING_EXPOSURE', 'LIMITS')
+NUMBERS = ('CCD_CONTROLS', 'CCD_GAIN', 'CCD_FRAME', 'CCD_BINNING', 'CCD_STREAM_FRAME', 'STREAMING_EXPOSURE', 'LIMITS')
 SWITCHES = ('STREAM_FULL_DEPTH', 'CCD_STREAM_ENCODER', 'CCD_VIDEO_FORMAT', 'CCD_CAPTURE_FORMAT', 'CCD_VIDEO_STREAM')
 
 # restore order (focus_spike.py restore): the stream off first, then formats, then numbers; the stream stays off
 RESTORE_SWITCHES = ('STREAM_FULL_DEPTH', 'CCD_STREAM_ENCODER', 'CCD_VIDEO_FORMAT', 'CCD_CAPTURE_FORMAT')
-RESTORE_NUMBERS = ('CCD_BINNING', 'CCD_FRAME', 'CCD_STREAM_FRAME', 'STREAMING_EXPOSURE', 'LIMITS', 'CCD_CONTROLS')
+RESTORE_NUMBERS = ('CCD_BINNING', 'CCD_FRAME', 'CCD_STREAM_FRAME', 'STREAMING_EXPOSURE', 'LIMITS', 'CCD_CONTROLS',
+                   'CCD_GAIN')
 
 # a session does not start without these: it could not put the camera back (or stream at all) without them
 REQUIRED = ('CCD_FRAME',)
 REQUIRED_VIDEO = ('CCD_VIDEO_STREAM', 'CCD_STREAM_ENCODER', 'STREAMING_EXPOSURE')
 
-CONTROL_TIMEOUT_S = 1.0       # finding a property; get_control waits forever on 0
+RESTORE_NOTICE_KEY = 'focus_restore'
+MSG_RESTORE_FAILED = ('The focus session could not put back the camera setting {0}. indi-allsky tries again when '
+                      'capture restarts; until then pictures may come out wrong.')
+
+CONTROL_TIMEOUT_S = 1.0      # finding a property; get_control waits forever on 0
 SET_TIMEOUT_S = 5.0           # a property change to settle
 WHOLE_FRAME_TIMEOUT_S = 30.0
 MAX_QUEUED = 4                # frames waiting for the controller; older ones are dropped
@@ -52,6 +57,13 @@ MAX_QUEUED = 4                # frames waiting for the controller; older ones ar
 # has it (`_has`). IndiClient.set_switch/set_number look a property up with the client's full timeout, so a missing
 # one is skipped after a short look instead.
 ISS_ON = 1
+
+# Where a driver keeps its gain, in the order IndiClient.setCcdGain (camera/indi.py) prefers them: CCD_CONTROLS/Gain
+# (ZWO, ToupTek and kin, Player One, svbony since INDI 2.0.4), else CCD_GAIN/GAIN (QHY, the simulator, rpicam,
+# libcamera, DSI, older svbony). setCcdGain itself is not called: it picks by driver name, raises for a driver it
+# does not know and updates capture's shared gain value. A driver with neither cannot have its gain set here.
+GAIN_PROPERTIES = (('CCD_CONTROLS', 'Gain'), ('CCD_GAIN', 'GAIN'))
+_UNPROBED = object()
 
 
 def _on(state) -> bool:
@@ -185,11 +197,32 @@ def remove_state(path: str) -> None:
         logger.error('Focus: could not delete the saved camera state: %s', e)
 
 
-def focus_startup_restore(camera, path: str) -> bool:
-    """At capture start: if a session left its saved state (the process died in it), restore the camera and delete
-    the file. True when a state was restored. The file is always deleted, so a bad one cannot block every start."""
+def required_failures(failures) -> list:
+    """The restore failures that leave the camera unfit for capture: these keep the state file for a retry."""
+    return [name for name in failures if name in REQUIRED + REQUIRED_VIDEO]
+
+
+def raise_restore_notice(notify, required) -> None:
+    """notify(RESTORE_NOTICE_KEY, message) for required properties that were not put back; never raises."""
+    if notify is None:
+        return
+    try:
+        notify(RESTORE_NOTICE_KEY, MSG_RESTORE_FAILED.format(', '.join(required)))
+    except Exception as e:
+        logger.error('Focus: the notification could not be raised (%s)', type(e).__name__)
+
+
+def focus_startup_restore(camera, path: str, notify=None) -> bool:
+    """At capture start: if a session left its saved state (the process died in it, or a required property could
+    not be put back), restore the camera. True when a state was restored. Never raises.
+
+    The file is deleted unless a required property fails again: then it stays, so the next start (and the next
+    session, which returns to it) tries again, and notify(key, message) raises the same notice a session's end
+    does. Capture is never held up by it. A file that cannot be read is deleted, so a bad one cannot block every
+    start."""
     if not os.path.exists(path):
         return False
+    keep = False
     try:
         try:
             with open(path) as f:
@@ -203,12 +236,19 @@ def focus_startup_restore(camera, path: str) -> bool:
         failures = restore_state(camera, state)
         if failures:
             logger.error('Focus: %d camera properties could not be restored', len(failures))
+        required = required_failures(failures)
+        if required:
+            keep = True
+            logger.error('Focus: a required camera property was not restored: %s; trying again at the next start',
+                         ', '.join(required))
+            raise_restore_notice(notify, required)
         return True
     except Exception:
         logger.exception('Focus: restoring the camera at startup failed')
         return False
     finally:
-        remove_state(path)
+        if not keep:
+            remove_state(path)
 
 
 # -- the stream -----------------------------------------------------------------------------------------------------
@@ -231,6 +271,7 @@ class IndiStreamSource(object):
         self._ctl = threading.RLock()     # one camera reconfiguration at a time
         self._cond = threading.Condition()
         self._running = False
+        self._generation = 0              # counts start()s: a whole_frame begun before a restart ends with it
         self._region = None               # the region the controller asked for
         self._streaming = None            # the region the camera is streaming now
         self._exposure = 0.0
@@ -240,9 +281,15 @@ class IndiStreamSource(object):
         self._whole = None
         self._fps_max = None
         self._present = {}                # optional property -> whether the driver has it
+        self._gain_prop = _UNPROBED       # (property, element) the gain goes to, or None: see GAIN_PROPERTIES
         self._size_warned = False         # a blob of the wrong size is reported once per session
 
     # -- PictureSource -----------------------------------------------------------------------------------------------
+
+    def can_set_gain(self) -> bool:
+        """False when the driver has no gain property the stream can set: a new gain is then ignored, and every
+        frame keeps the gain the camera has."""
+        return self._simulated or self._gain_property() is not None
 
     def start(self, roi, exposure, gain):
         w, h = self._sensor_size()
@@ -252,6 +299,11 @@ class IndiStreamSource(object):
             self._exposure = float(exposure)
             self._gain = float(gain)
             self._running = True
+            self._generation += 1
+            # a whole_frame still waiting belongs to the stream before this start: release it, and stop it holding
+            # back this stream's frames
+            self._whole_waiting = False
+            self._cond.notify_all()
             self._size_warned = False
         self.client.blob_sink = self._on_blob
         self._configure(region)
@@ -259,10 +311,12 @@ class IndiStreamSource(object):
     def set_camera(self, exposure, gain):
         """Restart the stream with new settings. While it restarts no frame is taken: one still on its way was
         exposed with the old settings and would carry the new label."""
+        settable = self.can_set_gain()
         with self._ctl:
             with self._cond:
                 self._exposure = float(exposure)
-                self._gain = float(gain)
+                if settable:
+                    self._gain = float(gain)
                 if not self._running:
                     return
                 streaming, self._streaming = self._streaming, None
@@ -285,14 +339,16 @@ class IndiStreamSource(object):
         with self._cond:
             if not self._running:
                 raise RuntimeError('the picture source stopped')
+            generation = self._generation
             self._whole = None
             self._whole_waiting = True
         try:
-            self._configure(full)
+            self._configure(full, generation)
             deadline = time.monotonic() + timeout
             with self._cond:
                 while self._whole is None:
-                    if not self._running:
+                    # stopped, or stopped and started again (a region change) before this thread woke up
+                    if not self._running or self._generation != generation:
                         raise RuntimeError('the picture source stopped')
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
@@ -301,11 +357,13 @@ class IndiStreamSource(object):
                 return self._whole
         finally:
             with self._cond:
-                self._whole_waiting = False
-                self._whole = None
+                same = self._generation == generation
+                if same:
+                    self._whole_waiting = False
+                    self._whole = None
                 running, region = self._running, self._region
-            if running:
-                self._configure(region)
+            if running and same:  # a restart has already put its own region on the camera
+                self._configure(region, generation)
 
     def stop(self):
         with self._cond:
@@ -326,11 +384,12 @@ class IndiStreamSource(object):
 
     # -- camera ------------------------------------------------------------------------------------------------------
 
-    def _configure(self, region):
-        """The start order (focus_spike.py prep_stream): stream off, region, format, rate, gain, exposure, on."""
+    def _configure(self, region, generation=None):
+        """The start order (focus_spike.py prep_stream): stream off, region, format, rate, gain, exposure, on.
+        generation: whole_frame's; when a restart came since, its region is on the camera and this does nothing."""
         with self._ctl:
             with self._cond:
-                if not self._running:
+                if not self._running or (generation is not None and generation != self._generation):
                     return
             if self._simulated:
                 self._set_streaming(region)
@@ -358,8 +417,9 @@ class IndiStreamSource(object):
             exposure, gain = self._exposure, self._gain
         if self._has('LIMITS', 'number'):
             client.set_number(device, 'LIMITS', {'LIMITS_PREVIEW_FPS': self._fps(exposure)}, timeout=SET_TIMEOUT_S)
-        if self._has('CCD_CONTROLS', 'number'):
-            client.set_number(device, 'CCD_CONTROLS', {'Gain': gain}, timeout=SET_TIMEOUT_S)
+        prop = self._gain_property()
+        if prop is not None:
+            client.set_number(device, prop[0], {prop[1]: gain}, timeout=SET_TIMEOUT_S)
         client.set_number(device, 'STREAMING_EXPOSURE',
                           {'STREAMING_EXPOSURE_VALUE': exposure, 'STREAMING_DIVISOR_VALUE': 1},
                           timeout=SET_TIMEOUT_S)
@@ -373,6 +433,22 @@ class IndiStreamSource(object):
                 logger.warning('Focus: the camera driver has no %s; it is left as it is', name)
                 self._present[name] = False
         return self._present[name]
+
+    def _gain_property(self):
+        if self._gain_prop is _UNPROBED:
+            found = None
+            for name, element in GAIN_PROPERTIES:
+                try:
+                    ctl = self.client.get_control(_device(self.client), name, 'number', timeout=CONTROL_TIMEOUT_S)
+                except Exception:
+                    continue
+                if any(e.getName() == element for e in ctl):
+                    found = (name, element)
+                    break
+            if found is None:
+                logger.warning('Focus: the camera driver has no gain property; the gain is left as it is')
+            self._gain_prop = found
+        return self._gain_prop
 
     def _stream(self, on):
         # sync=False: the driver keeps CCD_VIDEO_STREAM at BUSY for as long as it streams, so a wait for OK would

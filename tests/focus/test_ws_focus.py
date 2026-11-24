@@ -274,6 +274,21 @@ def test_page_leaving_closes_the_link(web, server):
     assert _wait(lambda: server.clients() == [])
 
 
+def test_a_failed_websocket_accept_closes_the_link(web, server, simple_websocket, monkeypatch):
+    held = []
+
+    def accept(environ, **kwargs):
+        held.append(_wait(lambda: len(server.clients()) == 1))  # the link is open before the accept
+        raise RuntimeError('handshake failed')
+
+    monkeypatch.setattr(simple_websocket.Server, 'accept', staticmethod(accept))
+    with web.app.test_client() as client:
+        client.get('/indi-allsky/ws/focus', headers={'Upgrade': 'websocket', 'Connection': 'Upgrade'},
+                   environ_base={'REMOTE_ADDR': OUTSIDE_IP})
+    assert held == [True], 'the page never registered on the link'
+    assert _wait(lambda: server.clients() == []), 'the link stayed open after the accept failed'
+
+
 def test_frames_relayed_unchanged_as_binary(web, server):
     from indi_allsky.focus.frame import pack_frame
     frame = pack_frame(b'\xff\xd8jpeg\xff\xd9', 7, 1700000000.5, 0.1, 50.0, 3)

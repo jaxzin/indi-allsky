@@ -201,13 +201,14 @@ def test_set_camera_restarts_stream():
 
 
 def test_saved_state_is_exact_property_list():
-    assert NUMBERS == ('CCD_CONTROLS', 'CCD_FRAME', 'CCD_BINNING', 'CCD_STREAM_FRAME', 'STREAMING_EXPOSURE', 'LIMITS')
+    assert NUMBERS == ('CCD_CONTROLS', 'CCD_GAIN', 'CCD_FRAME', 'CCD_BINNING', 'CCD_STREAM_FRAME', 'STREAMING_EXPOSURE',
+                       'LIMITS')
     assert SWITCHES == ('STREAM_FULL_DEPTH', 'CCD_STREAM_ENCODER', 'CCD_VIDEO_FORMAT', 'CCD_CAPTURE_FORMAT',
                         'CCD_VIDEO_STREAM')
     client = FakeClient()
     state = save_state(client)
     assert set(state) == {'numbers', 'switches'}
-    assert set(state['numbers']) == set(NUMBERS)  # CCD_EXPOSURE is on the device but not saved
+    assert set(state['numbers']) == set(NUMBERS) - {'CCD_GAIN'}  # a ZWO has no CCD_GAIN; CCD_EXPOSURE is not saved
     assert set(state['switches']) == set(SWITCHES)  # CCD_ABORT_EXPOSURE neither
     assert state['numbers']['CCD_CONTROLS'] == {'Gain': 100.0, 'Offset': 10.0}
     assert state['switches']['CCD_STREAM_ENCODER'] == ['MJPEG']
@@ -220,7 +221,7 @@ def test_saved_state_skips_a_missing_property():
     del client.numbers['LIMITS']
     state = save_state(client)
     assert 'LIMITS' not in state['numbers']
-    assert set(state['numbers']) == set(NUMBERS) - {'LIMITS'}
+    assert set(state['numbers']) == set(NUMBERS) - {'LIMITS', 'CCD_GAIN'}
 
 
 def test_restore_puts_values_back_and_never_starts_the_stream():
@@ -264,6 +265,54 @@ def test_startup_restores_after_crash(tmp_path):
     assert focus_startup_restore(client, path) is True
     assert client.numbers['CCD_CONTROLS']['Gain'][0] == 100.0
     assert not os.path.exists(path)
+
+
+@pytest.mark.parametrize('broken', ['CCD_FRAME', 'CCD_STREAM_ENCODER', 'STREAMING_EXPOSURE'])
+def test_startup_restore_keeps_the_file_and_raises_a_notice_when_a_required_property_fails(tmp_path, broken):
+    client = FakeClient()
+    state = save_state(client)
+    path = str(tmp_path / 'focus-session.state.json')
+    with open(path, 'w') as f:
+        json.dump(state, f)
+    client.numbers.pop(broken, None)  # the driver does not take it back this time
+    client.switches.pop(broken, None)
+    notices = []
+    assert focus_startup_restore(client, path, notify=lambda key, msg: notices.append((key, msg))) is True
+    assert os.path.exists(path)  # the next start tries again
+    assert notices == [(indi_stream.RESTORE_NOTICE_KEY, indi_stream.MSG_RESTORE_FAILED.format(broken))]
+    # the next start: the property is back, the restore works, the file goes
+    client.numbers.update({k: v for k, v in default_numbers().items() if k == broken})
+    client.switches.update({k: v for k, v in default_switches().items() if k == broken})
+    notices.clear()
+    assert focus_startup_restore(client, path, notify=lambda key, msg: notices.append((key, msg))) is True
+    assert not os.path.exists(path) and notices == []
+
+
+def test_startup_restore_drops_the_file_when_only_an_optional_property_fails(tmp_path):
+    client = FakeClient()
+    state = save_state(client)
+    path = str(tmp_path / 'focus-session.state.json')
+    with open(path, 'w') as f:
+        json.dump(state, f)
+    del client.numbers['LIMITS']
+    notices = []
+    assert focus_startup_restore(client, path, notify=lambda key, msg: notices.append((key, msg))) is True
+    assert not os.path.exists(path) and notices == []
+
+
+def test_startup_restore_survives_a_failing_notify(tmp_path):
+    client = FakeClient()
+    state = save_state(client)
+    path = str(tmp_path / 'focus-session.state.json')
+    with open(path, 'w') as f:
+        json.dump(state, f)
+    del client.numbers['CCD_FRAME']
+
+    def broken(key, msg):
+        raise RuntimeError('no database')
+
+    assert focus_startup_restore(client, path, notify=broken) is True  # never raises
+    assert os.path.exists(path)
 
 
 def test_startup_restore_without_a_file_does_nothing(tmp_path):
@@ -526,3 +575,127 @@ def test_frames_in_flight_during_a_restart_are_dropped_not_relabelled():
     frame = src.frames.get(timeout=1)
     assert (frame.exposure, frame.gain) == (0.5, 20.0)
     src.stop()
+
+
+# -- final review ------------------------------------------------------------------------------------------------------
+
+def test_a_restart_during_whole_frame_releases_it_and_region_frames_flow_at_once():
+    # set_region is stop() then start(). If start() sets _running before the whole_frame thread wakes, that thread
+    # must still learn the source was restarted: otherwise it waits on, and every region frame is dropped meanwhile.
+    client = FakeClient()
+    src = IndiStreamSource(client, sensor=(64, 48))
+    src.start((8, 8, 16, 16), 0.1, 0)
+    errors = []
+
+    def take():
+        try:
+            src.whole_frame(timeout=3.0)
+        except Exception as e:
+            errors.append(e)
+
+    t = threading.Thread(target=take)
+    t.start()
+    deadline = time.monotonic() + 5
+    while not [c for c in client.calls if c[1] == 'CCD_FRAME' and c[2]['WIDTH'] == 64] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.05)  # parked in the wait
+    with src._cond:  # an RLock: the waiter cannot wake until both are done
+        src.stop()
+        src.start((16, 16, 16, 16), 0.1, 0)
+    t.join(1.0)
+    assert not t.is_alive(), 'whole_frame still waits after the restart'
+    assert errors and isinstance(errors[0], RuntimeError)
+    client.blob_sink(u16(np.full((16, 16), 3)), '.stream', 5.0)
+    assert src.frames.get(timeout=0.5).t_end == 5.0  # the new region's frames are not held back
+    frames = [c[2] for c in client.taken() if c[1] == 'CCD_FRAME']
+    assert frames[-1] == {'X': 16, 'Y': 16, 'WIDTH': 16, 'HEIGHT': 16}  # whole_frame did not move it again
+    src.stop()
+
+
+def test_a_restart_before_whole_frame_configures_keeps_the_new_region():
+    client = FakeClient()
+    src = IndiStreamSource(client, sensor=(64, 48))
+    src.start((8, 8, 16, 16), 0.1, 0)
+    client.taken()
+    errors = []
+
+    def take():
+        try:
+            src.whole_frame(timeout=3.0)
+        except Exception as e:
+            errors.append(e)
+
+    with src._ctl:  # whole_frame waits here to put the whole sensor on the camera
+        t = threading.Thread(target=take)
+        t.start()
+        deadline = time.monotonic() + 5
+        while not src._whole_waiting and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.05)
+        src.stop()
+        src.start((16, 16, 16, 16), 0.1, 0)
+    t.join(1.0)
+    assert not t.is_alive() and errors
+    frames = [c[2] for c in client.taken() if c[1] == 'CCD_FRAME']
+    assert frames == [{'X': 16, 'Y': 16, 'WIDTH': 16, 'HEIGHT': 16}]  # never the whole sensor after the restart
+    src.stop()
+
+
+def ccd_gain_client():
+    """A driver with gain in CCD_GAIN/GAIN (indi_qhy_ccd, indi_simulator_ccd, indi_rpicam, indi_libcamera_ccd,
+    indi_dsi_ccd, svbony before INDI 2.0.4), not in CCD_CONTROLS/Gain."""
+    client = FakeClient()
+    del client.numbers['CCD_CONTROLS']
+    client.numbers['CCD_GAIN'] = {'GAIN': (30.0, 0, 100)}
+    return client
+
+
+def gains_set(calls):
+    return [(c[1], c[2]) for c in calls if c[1] in ('CCD_CONTROLS', 'CCD_GAIN')]
+
+
+def test_gain_goes_to_ccd_gain_when_the_driver_has_no_ccd_controls_gain():
+    client = ccd_gain_client()
+    src = IndiStreamSource(client, sensor=SENSOR)
+    assert src.can_set_gain()
+    src.start((0, 0, 64, 64), 0.1, 40)
+    assert gains_set(client.taken()) == [('CCD_GAIN', {'GAIN': 40.0})]
+    src.set_camera(0.2, 60)
+    assert gains_set(client.taken()) == [('CCD_GAIN', {'GAIN': 60.0})]
+    client.blob_sink(u16(np.zeros((64, 64))), '.stream', 1.0)
+    assert src.frames.get(timeout=1).gain == 60.0
+    src.stop()
+
+
+def test_ccd_controls_without_a_gain_element_falls_back_to_ccd_gain():
+    client = ccd_gain_client()
+    client.numbers['CCD_CONTROLS'] = {'Offset': (10.0, 0, 255)}
+    src = IndiStreamSource(client, sensor=SENSOR)
+    src.start((0, 0, 64, 64), 0.1, 40)
+    assert gains_set(client.taken()) == [('CCD_GAIN', {'GAIN': 40.0})]
+    src.stop()
+
+
+def test_a_driver_without_gain_never_claims_a_changed_gain():
+    client = FakeClient()
+    del client.numbers['CCD_CONTROLS']
+    src = IndiStreamSource(client, sensor=SENSOR)
+    assert not src.can_set_gain()
+    src.start((0, 0, 64, 64), 0.1, 40)
+    src.set_camera(0.2, 300)
+    assert gains_set(client.taken()) == []
+    client.blob_sink(u16(np.zeros((64, 64))), '.stream', 1.0)
+    frame = src.frames.get(timeout=1)
+    assert (frame.exposure, frame.gain) == (0.2, 40.0)  # the gain the camera has, not the one asked for
+    src.stop()
+
+
+def test_ccd_gain_is_saved_and_put_back():
+    client = ccd_gain_client()
+    state = save_state(client)
+    assert state['numbers']['CCD_GAIN'] == {'GAIN': 30.0}
+    src = IndiStreamSource(client, sensor=SENSOR)
+    src.start((0, 0, 64, 64), 0.1, 90)
+    src.stop()
+    assert restore_state(client, state) == []
+    assert client.numbers['CCD_GAIN']['GAIN'][0] == 30.0

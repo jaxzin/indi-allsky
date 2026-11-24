@@ -27,15 +27,16 @@ from indi_allsky.focus.controller import FocusController
 from indi_allsky.focus.controller import FocusService
 from indi_allsky.focus.controller import MSG_MISSING_PROPERTY
 from indi_allsky.focus.controller import StartRefused
+from indi_allsky.focus.exposure_search import SHORTEST_FLOOR_S
 from indi_allsky.focus.exposure_search import ExposureSearch
 from indi_allsky.focus.exposure_search import default_ceiling
 from indi_allsky.focus.indi_stream import IndiStreamSource
 from indi_allsky.focus.indi_stream import MissingProperty
-from indi_allsky.focus.indi_stream import REQUIRED
-from indi_allsky.focus.indi_stream import REQUIRED_VIDEO
 from indi_allsky.focus.indi_stream import has_video
+from indi_allsky.focus.indi_stream import raise_restore_notice
 from indi_allsky.focus.indi_stream import read_state
 from indi_allsky.focus.indi_stream import remove_state
+from indi_allsky.focus.indi_stream import required_failures
 from indi_allsky.focus.indi_stream import restore_state
 from indi_allsky.focus.indi_stream import save_state
 from indi_allsky.focus.indi_stream import write_state
@@ -50,11 +51,7 @@ logger = logging.getLogger('indi_allsky')
 
 STATE_SUFFIX = '.state.json'
 VIDEO_START_EXPOSURE_S = 0.1
-SHORTEST_FLOOR_S = 1e-6      # a driver that reports a minimum exposure of 0 or less
 VIDEO_REGION_PX = 1024       # the first region: a centred square, at most this size
-RESTORE_NOTICE_KEY = 'focus_restore'
-MSG_RESTORE_FAILED = ('The focus session could not put back the camera setting {0}. indi-allsky tries again when '
-                      'capture restarts; until then pictures may come out wrong.')
 
 
 def state_path_for(address: str) -> str:
@@ -69,8 +66,9 @@ def open_link(address: str) -> Optional[LinkServer]:
     try:
         link.start()
     except (LinkError, OSError) as e:
-        logger.warning('Focus: the live focus link is not available (%s); the focus page shows the classic view',
-                       type(e).__name__)
+        # a plain LinkError carries one of link.py's own fixed messages (a directory, not a socket): say which
+        why = str(e) if type(e) is LinkError else type(e).__name__
+        logger.warning('Focus: the live focus link is not available (%s); the focus page shows the classic view', why)
         try:
             link.close()
         except Exception:
@@ -230,11 +228,11 @@ class FocusGlue(object):
                 failures = restore_state(self.camera, saved)
                 if failures:
                     logger.error('Focus: %d camera properties could not be restored', len(failures))
-                required = [name for name in failures if name in REQUIRED + REQUIRED_VIDEO]
+                required = required_failures(failures)
                 if required:
                     # the state file stays: capture tries the restore again when it starts
                     logger.error('Focus: a required camera property was not restored: %s', ', '.join(required))
-                    self._raise_notice(MSG_RESTORE_FAILED.format(', '.join(required)))
+                    raise_restore_notice(self._notify, required)
                 else:
                     # an optional property that failed would only fail again at the next startup
                     remove_state(self.state_path)
@@ -243,11 +241,3 @@ class FocusGlue(object):
                 self.camera.blob_sink = None  # capture's exposures go to the image queue again
             if not gone:
                 self._reconfigure()
-
-    def _raise_notice(self, message: str) -> None:
-        if self._notify is None:
-            return
-        try:
-            self._notify(RESTORE_NOTICE_KEY, message)
-        except Exception as e:
-            logger.error('Focus: the notification could not be raised (%s)', type(e).__name__)

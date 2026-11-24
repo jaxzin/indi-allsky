@@ -14,6 +14,7 @@ OVER_FRACTION = 0.80
 BRIGHT_FRACTION = 0.15
 
 MAX_CEILING_S = 15.0
+SHORTEST_FLOOR_S = 1e-6  # the shortest exposure when the one given is 0 or less
 
 MSG_NO_STARS = 'No stars to measure. Try a longer exposure.'
 MSG_SHORTEST_OVER = 'The camera\'s shortest exposure is still over-exposed.'
@@ -51,9 +52,10 @@ def default_ceiling(ccd_exposure_max: float | None) -> float:
 class ExposureSearch(object):
 
     def __init__(self, shortest: float, ceiling: float, start: float) -> None:
-        self.shortest = float(shortest)
-        self.ceiling = float(ceiling)
-        self.exposure = float(start)
+        # doubling 0 stays 0, so a search from 0 (or below, or NaN) would never finish: floor them
+        self.shortest = float(shortest) if float(shortest) > 0 else SHORTEST_FLOOR_S
+        self.ceiling = max(float(ceiling), self.shortest)
+        self.exposure = float(start) if float(start) > 0 else self.shortest
         self._final: SearchStep | None = None
 
     def _finish(self, message: str) -> SearchStep:

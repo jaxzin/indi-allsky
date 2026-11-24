@@ -129,3 +129,15 @@ def test_step_after_done_returns_same_result():
     assert final.done is True
     assert s.step(0, 'dark') == final
     assert s.step(0, 'over') == final
+
+
+def test_a_zero_or_negative_start_still_reaches_the_ceiling():
+    # 0 * 2 == 0: unclamped, the search would ask for 0 s forever and never finish
+    for shortest, start in ((0.0, 0.0), (-1.0, 0.0), (0.0, -0.5), (float('nan'), float('nan'))):
+        s = ExposureSearch(shortest=shortest, ceiling=15.0, start=start)
+        assert s.shortest > 0 and s.exposure > 0
+        for _ in range(64):
+            step = s.step(0, 'dark')
+            if step.done:
+                break
+        assert step.done and step.exposure == 15.0
