@@ -1,5 +1,7 @@
 """Rig table (spec 6.9): which focus page, which picture mode and which reason for each camera type."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 from .starlight import sensor_for_device
