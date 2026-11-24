@@ -504,15 +504,55 @@ class LinkServer(object):
 
 
 class LinkClient(object):
-    """The web-side end of the link, one per focus page."""
+    """The web-side end of the link, one per focus page.
+
+    ``send`` and ``recv`` may run on different threads, and ``close`` is safe from any
+    thread. ``close`` shuts the socket down, which wakes a blocked ``recv`` with
+    ``LinkUnavailable('closed')``; the fd and selector are released only once no
+    ``send``/``recv`` is still using them, so a blocked call never sees a closed or
+    reused fd (closing an fd under a blocked epoll_wait may not wake it on Linux).
+    """
 
     def __init__(self, path: str, timeout: float = 2.0):
         self.path = path
         self.timeout = timeout
+        self._state = threading.Lock()  # guards _sock, _selector, _closed, _users
         self._sock = None
         self._selector = None
-        self._buf = bytearray()
+        self._closed = True
+        self._users = 0  # send/recv calls holding the socket
+        self._buf = bytearray()  # used by recv only
         self._send_lock = threading.Lock()
+
+    def _acquire(self):
+        with self._state:
+            if self._closed or self._sock is None:
+                raise LinkUnavailable('closed')
+            self._users += 1
+            return self._sock, self._selector
+
+    def _release(self):
+        with self._state:
+            self._users -= 1
+            finish = self._closed and self._users == 0
+            if finish:
+                sock, sel = self._sock, self._selector
+                self._sock = self._selector = None
+        if finish:
+            self._dispose(sock, sel)
+
+    @staticmethod
+    def _dispose(sock, sel):
+        if sel is not None:
+            try:
+                sel.close()
+            except Exception:
+                pass
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
     def connect(self) -> None:
         """Connect and say hello. Raises LinkUnavailable(reason)."""
@@ -532,9 +572,13 @@ class LinkClient(object):
         except OSError:
             sock.close()
             raise LinkUnavailable('unreachable')
-        self._sock = sock
-        self._selector = selectors.DefaultSelector()
-        self._selector.register(sock, selectors.EVENT_READ)
+        sel = selectors.DefaultSelector()
+        sel.register(sock, selectors.EVENT_READ)
+        with self._state:
+            self._sock = sock
+            self._selector = sel
+            self._closed = False
+            self._users = 0
         self._buf = bytearray()
         try:
             self.send(HELLO)
@@ -543,45 +587,58 @@ class LinkClient(object):
             raise
 
     def send(self, obj: dict) -> None:
-        if self._sock is None:
-            raise LinkUnavailable('closed')
         payload = _encode_json(obj)
         if len(payload) > CLIENT_JSON_MAX:
             raise ValueError('command larger than the link allows')
+        sock, _ = self._acquire()
         try:
             with self._send_lock:
-                self._sock.sendall(_header(KIND_JSON, payload) + payload)
+                sock.sendall(_header(KIND_JSON, payload) + payload)
         except socket.timeout:
             raise LinkUnavailable('timeout')
         except OSError:
             raise LinkUnavailable('closed')
+        finally:
+            self._release()
 
     def recv(self, timeout: float | None = None):
         """('json', dict), ('frame', bytes), or None on timeout.
 
-        Raises LinkUnavailable('closed') when the server goes away. A message that is only
-        partly received when the timeout passes stays buffered for the next call.
+        Raises LinkUnavailable('closed') when the server goes away or close() is called,
+        from any thread. A message that is only partly received when the timeout passes
+        stays buffered for the next call.
         """
-        if self._sock is None:
-            raise LinkUnavailable('closed')
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            msg = self._parse()
-            if msg is not None:
-                return msg
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
-            if not self._selector.select(remaining):
-                return None
-            try:
-                chunk = self._sock.recv(1024 * 1024)
-            except socket.timeout:
-                continue
-            except OSError:
-                chunk = b''
-            if not chunk:
-                self.close()
-                raise LinkUnavailable('closed')
-            self._buf.extend(chunk)
+        sock, sel = self._acquire()
+        try:
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while True:
+                if self._closed:
+                    raise LinkUnavailable('closed')
+                msg = self._parse()
+                if msg is not None:
+                    return msg
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                try:
+                    ready = sel.select(remaining)
+                except (OSError, ValueError):
+                    self.close()
+                    raise LinkUnavailable('closed')
+                if not ready:
+                    if self._closed:
+                        raise LinkUnavailable('closed')
+                    return None
+                try:
+                    chunk = sock.recv(1024 * 1024)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    chunk = b''
+                if not chunk:
+                    self.close()
+                    raise LinkUnavailable('closed')
+                self._buf.extend(chunk)
+        finally:
+            self._release()
 
     def _parse(self):
         if len(self._buf) < _HEADER.size:
@@ -607,18 +664,24 @@ class LinkClient(object):
         return ('json', obj)
 
     def close(self) -> None:
-        if self._selector is not None:
-            try:
-                self._selector.close()
-            except Exception:
-                pass
-            self._selector = None
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
+        """Close the link. Idempotent and safe from any thread."""
+        with self._state:
+            if self._closed:
+                return
+            self._closed = True
+            sock, sel = self._sock, self._selector
+            if sock is not None:
+                try:
+                    # Wakes a recv blocked in select (the socket reads as EOF) and makes
+                    # a concurrent sendall fail, on both macOS and Linux.
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            finish = self._users == 0
+            if finish:
+                self._sock = self._selector = None
+        if finish:
+            self._dispose(sock, sel)
 
 
 def probe(path: str) -> bool:

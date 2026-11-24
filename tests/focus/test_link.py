@@ -466,3 +466,116 @@ def test_close_leaves_socket_that_is_not_ours(sock_path, closers):
 
 def test_close_without_start_is_safe(sock_path):
     LinkServer(sock_path).close()
+
+
+class _SignalSelector(object):
+    """Wraps a client's selector to report when recv is about to block in select."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.entered = threading.Event()
+
+    def select(self, timeout=None):
+        self.entered.set()
+        return self.inner.select(timeout)
+
+    def close(self):
+        self.inner.close()
+
+
+class _CloseOnEnter(object):
+    """Stands in for the send lock and closes the client at the worst moment."""
+
+    def __init__(self, client):
+        self.client = client
+
+    def __enter__(self):
+        self.client.close()
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def _recv_in_thread(client):
+    result = {}
+
+    def run():
+        try:
+            result['value'] = client.recv(None)
+        except BaseException as e:  # record whatever escapes, for the assertion
+            result['exc'] = e
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    return t, result
+
+
+def test_send_racing_close_raises_link_unavailable(sock_path, closers):
+    server = make_server(sock_path, closers)
+    client = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    # close() lands after send has taken the socket and before it writes.
+    client._send_lock = _CloseOnEnter(client)
+    with pytest.raises(LinkUnavailable) as exc:
+        client.send({'cmd': 'x'})
+    assert exc.value.reason == 'closed'
+    with pytest.raises(LinkUnavailable):
+        client.send({'cmd': 'y'})
+
+
+def test_concurrent_send_and_close_only_raise_link_unavailable(sock_path, closers):
+    server = make_server(sock_path, closers)
+    client = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    errors = []
+    started = threading.Event()
+
+    def spam():
+        started.set()
+        for i in range(100000):
+            try:
+                client.send({'i': i})
+            except LinkUnavailable:
+                return
+            except BaseException as e:
+                errors.append(e)
+                return
+
+    t = threading.Thread(target=spam, daemon=True)
+    t.start()
+    assert started.wait(2.0)
+    client.close()
+    t.join(2.0)
+    assert not t.is_alive()
+    assert errors == []
+
+
+def test_close_from_another_thread_wakes_blocked_recv(sock_path, closers):
+    server = make_server(sock_path, closers)
+    client = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    client._selector = _SignalSelector(client._selector)
+
+    t, result = _recv_in_thread(client)
+    assert client._selector.entered.wait(2.0)
+    client.close()
+    t.join(1.0)
+    assert not t.is_alive()
+    assert isinstance(result.get('exc'), LinkUnavailable), result
+    assert result['exc'].reason == 'closed'
+
+
+def test_server_close_wakes_blocked_recv(sock_path, closers):
+    server = make_server(sock_path, closers)
+    client = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    client._selector = _SignalSelector(client._selector)
+
+    t, result = _recv_in_thread(client)
+    assert client._selector.entered.wait(2.0)
+    server.close()
+    t.join(2.0)
+    assert not t.is_alive()
+    assert isinstance(result.get('exc'), LinkUnavailable), result
+    assert result['exc'].reason == 'closed'
