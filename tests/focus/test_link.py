@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import socket
 import stat
 import struct
-import tempfile
 import threading
 import time
 
@@ -35,27 +33,6 @@ def wait_for(cond, timeout=2.0):
         if value or time.monotonic() >= deadline:
             return value
         time.sleep(0.01)
-
-
-@pytest.fixture
-def sock_path():
-    # macOS caps AF_UNIX paths at 104 bytes and pytest's tmp_path is often longer.
-    d = tempfile.mkdtemp(prefix='iaf', dir='/tmp')
-    try:
-        yield os.path.join(d, 'focus.sock')
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
-
-
-@pytest.fixture
-def closers():
-    items = []
-    yield items
-    for item in reversed(items):
-        try:
-            item.close()
-        except Exception:
-            pass
 
 
 def make_server(sock_path, closers, **kwargs):
@@ -128,6 +105,37 @@ def test_round_trip_json_and_frame(sock_path, closers):
     assert client.recv(2.0) == ('json', {'kind': 'only-you'})
 
     assert client.recv(0.05) is None
+
+
+def test_hello_carries_extra_fields(sock_path, closers):
+    server = make_server(sock_path, closers)
+    plain = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    flagged = LinkClient(sock_path)
+    closers.append(flagged)
+    flagged.connect(hello={'controls': True, 'kind': 'not-hello'})
+    assert wait_for(lambda: len(server.clients()) == 2)
+    first, second = server.clients()
+
+    assert server.client_hello(first) == {'kind': 'hello'}
+    assert server.client_hello(second) == {'kind': 'hello', 'controls': True}
+    # The hello registers the page; it is not a command.
+    assert server.poll_commands() == []
+
+    # A later 'hello' is an ordinary command and does not change the registration hello.
+    plain.send({'kind': 'hello', 'controls': True})
+    cmds = []
+    wait_for(lambda: cmds.extend(server.poll_commands()) or cmds)
+    assert cmds == [(first, {'kind': 'hello', 'controls': True})]
+    assert server.client_hello(first) == {'kind': 'hello'}
+
+    # The returned dict is a copy.
+    server.client_hello(second)['controls'] = False
+    assert server.client_hello(second)['controls'] is True
+
+    plain.close()
+    assert wait_for(lambda: server.clients() == [second])
+    assert server.client_hello(first) is None
 
 
 def test_recv_keeps_partial_message_across_timeout(sock_path, closers):
@@ -454,7 +462,8 @@ def test_stalled_client_dropped_at_send_timeout(sock_path, closers, monkeypatch,
     server.broadcast_frame(frame)
     assert reader.recv(10.0) == ('frame', frame)
     assert wait_for(lambda: server.clients() == [reader_id], timeout=10.0)
-    assert _drop_reasons(caplog, stalled_id) == ['send timed out']
+    # _drop logs after it releases the lock, so the record can land just after clients() changes
+    assert wait_for(lambda: _drop_reasons(caplog, stalled_id)) == ['send timed out']
 
 
 def test_close_removes_socket_and_disconnects_clients(sock_path, closers):

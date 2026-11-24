@@ -11,6 +11,9 @@ A connection becomes a page only when its first message, ``{'kind': 'hello'}``, 
 (``LinkClient.connect()`` sends it). Until then it holds no page place, has no client id
 and is not in ``clients()``; one that closes or stays silent for ``HELLO_TIMEOUT_S`` is
 dropped quietly. So ``probe()`` and the live check in ``start()`` never take a place.
+The hello may carry extra fields (``LinkClient.connect(hello=...)``); the server keeps
+that registration hello and hands a copy back from ``client_hello()``. It is not queued
+as a command.
 
 Message contents are never logged.
 """
@@ -150,6 +153,7 @@ class _Conn(object):
 
     def __init__(self, sock):
         self.cid = None  # assigned at registration
+        self.hello = None  # the registration hello, set with cid
         self.sock = sock
         self.slot = NewestSlot()
         self.closed = threading.Event()
@@ -288,6 +292,12 @@ class LinkServer(object):
         with self._lock:
             return sorted(self._clients)
 
+    def client_hello(self, client_id: int) -> dict | None:
+        """A copy of the hello a connected page registered with; None if no such page."""
+        with self._lock:
+            conn = self._clients.get(client_id)
+            return dict(conn.hello) if conn is not None else None
+
     def poll_commands(self) -> list:
         with self._lock:
             commands, self._commands = self._commands, []
@@ -372,7 +382,7 @@ class LinkServer(object):
                 self._pending.add(conn)
             reader.start()
 
-    def _register(self, conn):
+    def _register(self, conn, hello):
         """Turn a connection that said hello into a page. False if it was refused."""
         with self._lock:
             if conn.closed.is_set():
@@ -380,6 +390,7 @@ class LinkServer(object):
             full = len(self._clients) >= self.max_clients
             if not full:
                 self._pending.discard(conn)
+                conn.hello = hello
                 conn.cid = self._next_cid
                 self._next_cid += 1
                 self._clients[conn.cid] = conn
@@ -460,7 +471,7 @@ class LinkServer(object):
             if obj.get('kind') != 'hello':
                 reason = 'first message was not hello'
                 return
-            if not self._register(conn):
+            if not self._register(conn, obj):
                 reason = 'refused'
                 return
 
@@ -554,8 +565,12 @@ class LinkClient(object):
             except OSError:
                 pass
 
-    def connect(self) -> None:
-        """Connect and say hello. Raises LinkUnavailable(reason)."""
+    def connect(self, hello: dict | None = None) -> None:
+        """Connect and say hello. Raises LinkUnavailable(reason).
+
+        ``hello`` adds fields to the hello (the web marks a page that may command with
+        ``{'controls': True}``); its ``kind`` is always ``'hello'``.
+        """
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.settimeout(self.timeout)
         try:
@@ -581,7 +596,7 @@ class LinkClient(object):
             self._users = 0
         self._buf = bytearray()
         try:
-            self.send(HELLO)
+            self.send(dict(hello or {}, **HELLO))
         except LinkUnavailable:
             self.close()
             raise
