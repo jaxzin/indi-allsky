@@ -581,3 +581,51 @@ def test_source_that_fails_to_start_ends_the_session(connect, make, source):
     assert not ctrl.active
     assert ctrl.end_reason == 'failed'
     assert page.json('ended')['reason'] == 'failed'
+
+
+def test_frame_from_before_a_region_change_is_skipped(session, source, epoch):
+    # a stills load in flight when the region moves can queue one old-region frame after the drain
+    ctrl, page = session
+    epoch.t = 1000.0
+    source.frames.put(raw_frame(GRID, t_end=1002.0, exposure=2.0))  # queued before: drained
+    ctrl.handle(page.cid, {'kind': 'set_region', 'roi': [0, 0, 256, 256]})
+    assert source.frames.empty()
+    page.json('mode')
+    source.frames.put(raw_frame(GRID, t_end=1001.0, exposure=2.0))  # began 999: the old region
+    source.frames.put(raw_frame(GRID, t_end=1003.0, exposure=2.0))  # began 1001
+    r = reading(page, ctrl=ctrl)
+    assert r['capture_time'] == pytest.approx(1002.0)
+    assert not [m for m in page.drain() if m[0] == 'json' and m[1].get('kind') == 'reading']
+
+
+def test_source_error_on_a_command_ends_the_session(session, source):
+    ctrl, page = session
+
+    def broken(exposure, gain):
+        raise RuntimeError('camera gone')
+
+    source.set_camera = broken
+    ctrl.handle(page.cid, {'kind': 'set_camera', 'exposure': 4.0, 'gain': 1})
+    assert not ctrl.active
+    assert page.json('ended')['reason'] == 'failed'
+
+
+def test_service_start_that_fails_returns_false(link, connect, source):
+    def broken(roi, exposure, gain):
+        raise RuntimeError('no camera')
+
+    source.start = broken
+    made = []
+
+    def make_controller(cid):
+        made.append(FocusController(source, link, FakeClock(), RIG, False, epoch=Epoch(), exposure=1.0, gain=1.0))
+        return made[-1]
+
+    service = FocusService(link, INFO, make_controller)
+    cid, page = connect()
+    page.client.send({'kind': 'start'})
+    results = []
+    idle = page.json('state', pump=lambda: results.append(service.poll()), idle_reason='failed')
+    assert idle['session'] == 'idle'
+    assert True not in results
+    assert len(made) == 1 and service.controller is None

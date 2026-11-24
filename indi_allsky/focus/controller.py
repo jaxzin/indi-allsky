@@ -225,6 +225,7 @@ class FocusController(object):
         self._stars_gen = 0
         self._min_snr = DEFAULT_MIN_SNR
         self._region_gen = 0
+        self._region_since = None  # epoch of the last region change
         self._pick_gen = 0
         self._pick_press = None   # epoch of the Pick stars press while a pick runs
         self._search = search
@@ -267,11 +268,7 @@ class FocusController(object):
                 self.rules.page_connected(cid)
             self._active = True
         logger.info('Focus session started by page %d', by_client)
-        try:
-            self.source.start(self.roi, self.exposure, self.gain)
-        except Exception:
-            logger.exception('Focus: the picture source failed to start')
-            self.end('failed')
+        if not self._source_call('start', self.source.start, self.roi, self.exposure, self.gain):
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name='focus-worker', daemon=True)
@@ -388,7 +385,8 @@ class FocusController(object):
         if busy:
             self._error(cid, 'set_camera', MSG_PICK_BUSY)
             return
-        self.source.set_camera(exposure, gain)
+        if not self._source_call('set the exposure', self.source.set_camera, exposure, gain):
+            return
         self.exposure, self.gain = exposure, gain
         if cmd_id is not None:
             with self._lock:
@@ -403,10 +401,17 @@ class FocusController(object):
                 self.ledger.begin(cmd_id)
             cancelled = self._pick_press is not None
             self._clear_stars_locked()
+        if not self._source_call('stop', self.source.stop):
+            return
+        _drain(self.source.frames)
+        with self._lock:
+            # a frame begun before now is from the old region; the worker skips it (a stills load in flight can
+            # still queue one after the drain)
             self._region_gen += 1
-        self.source.stop()
+            self._region_since = self._epoch()
         self.roi = roi
-        self.source.start(roi, self.exposure, self.gain)
+        if not self._source_call('start', self.source.start, roi, self.exposure, self.gain):
+            return
         if cmd_id is not None:
             with self._lock:
                 self.ledger.done(cmd_id, 0.0)
@@ -536,6 +541,16 @@ class FocusController(object):
 
     # -- worker requests (applied on the owning thread) ------------------------------------------------------------
 
+    def _source_call(self, what, fn, *args) -> bool:
+        """Call the picture source; on an error, log it and end the session as failed."""
+        try:
+            fn(*args)
+            return True
+        except Exception:
+            logger.exception('Focus: the picture source failed to %s', what)
+            self.end('failed')
+            return False
+
     def _post(self, request):
         self._requests.put(request)
 
@@ -572,7 +587,8 @@ class FocusController(object):
                 if step.done:
                     self._search_on = False
             if step.exposure is not None and not math.isclose(step.exposure, self.exposure):
-                self.source.set_camera(step.exposure, self.gain)
+                if not self._source_call('set the exposure', self.source.set_camera, step.exposure, self.gain):
+                    return
                 self.exposure = float(step.exposure)
                 self.link.broadcast_json(self._mode_msg())
             self.link.broadcast_json({'kind': 'progress', 'what': 'exposure_search', 'message': step.message,
@@ -614,6 +630,7 @@ class FocusController(object):
                 'stars': [(s['id'], s['x'], s['y'], self._star_state(s)) for s in self._stars],
                 'stars_gen': self._stars_gen,
                 'region_gen': self._region_gen,
+                'region_since': self._region_since,
                 'pick_gen': self._pick_gen,
                 'pick_press': self._pick_press,
                 'search_on': self._search_on,
@@ -624,6 +641,8 @@ class FocusController(object):
         exposure_start = frame.t_end - frame.exposure
         capture_time = frame.t_end - frame.exposure / 2.0
         snap = self._snapshot(exposure_start)
+        if snap['region_since'] is not None and exposure_start < snap['region_since']:
+            return  # taken before the region moved
         bayer = normalise_bayer(frame.bayer)
         full_scale = float(frame.full_scale)
         raw = frame.raw
@@ -793,6 +812,14 @@ class FocusController(object):
             snrs.append(max(float(m.snr), 0.0) if m is not None and math.isfinite(m.snr) else 0.0)
 
 
+def _drain(q):
+    while True:
+        try:
+            q.get_nowait()
+        except queue.Empty:
+            return
+
+
 class FocusService(object):
     """Commands while capture runs; owns at most one `FocusController` at a time."""
 
@@ -832,7 +859,7 @@ class FocusService(object):
                 controller = self._make(cid)
                 self.controller = controller
                 controller.begin(cid)
-                started = True
+                started = controller.active  # False when the source failed to start
             else:
                 self._error(cid, kind, MSG_NO_SESSION)
 
