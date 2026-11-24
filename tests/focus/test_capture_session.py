@@ -225,6 +225,9 @@ def test_classic_rig_refuses_start_without_touching_the_camera(sock_path, closer
     err = page.json('error', pump=lambda: run_session_pass(worker))
     assert err['command'] == 'start'
     assert camera.aborts == 0 and not glue.service.active
+    client.send({'kind': 'start'})
+    time.sleep(0.05)
+    assert focus_wait_turn(worker) is False  # nothing was aborted: capture keeps waiting for its exposure
 
 
 def test_stills_rig_uses_the_image_queue(sock_path, closers):

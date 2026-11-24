@@ -967,7 +967,12 @@ class FocusService(object):
                 if not hello or hello.get('controls') is not True:
                     self._error(cid, kind, MSG_CONTROLS)
                     continue
-                self._start_attempted = True
+                rig = self.camera_info.rig
+                if rig is None or rig.picture is None:
+                    # refused before the camera is touched: capture's exposure goes on
+                    self._error(cid, kind, (rig.reason if rig is not None else '') or MSG_START_FAILED)
+                    continue
+                self._start_attempted = True  # making the controller aborts the exposure in progress
                 try:
                     controller = self._make(cid)
                 except Exception:
