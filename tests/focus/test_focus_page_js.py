@@ -98,3 +98,11 @@ def test_words():
 
     assert got == ['0.21 s old', '3.4 s old', '13 s old', 'Live video · 10 pictures a second',
                    'Still pictures · 2 s each', '75 ms', '300']
+
+
+def test_live_rate_is_what_arrives_not_one_over_exposure():
+    got = run('console.log(JSON.stringify([h.liveText("video", 0.001, 0.1), h.liveText("video", 0.5, 0.1),'
+              ' h.liveText("video", null, null), h.liveText("stills", null, null)]));')
+
+    assert got == ['Live video · 10 pictures a second', 'Live video · 2 pictures a second', 'Live video',
+                   'Still pictures']

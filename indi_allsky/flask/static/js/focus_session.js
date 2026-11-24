@@ -129,12 +129,19 @@
         return Math.abs(g - Math.round(g)) < 1e-6 ? String(Math.round(g)) : g.toFixed(1);
     }
 
-    // The status line's words when the picture is live (section 6.4).
-    function liveText(picture, exposure) {
+    // The status line's words when the picture is live (section 6.4). interval: the measured s between pictures
+    // (null before two have arrived; the exposure stands in then).
+    function liveText(picture, exposure, interval) {
+        var valid = typeof exposure === 'number' && exposure > 0;
         if (picture === 'stills') {
-            return 'Still pictures · ' + fmtExposure(exposure) + ' each';
+            return valid ? 'Still pictures · ' + fmtExposure(exposure) + ' each' : 'Still pictures';
         }
-        var rate = 1 / exposure;
+        var every = typeof interval === 'number' && interval > 0 ? Math.max(interval, valid ? exposure : 0) :
+            (valid ? exposure : null);
+        if (every === null) {
+            return 'Live video';
+        }
+        var rate = 1 / every;
         var n = rate >= 1 ? Math.round(rate) : Number(rate.toFixed(1));
         return 'Live video · ' + n + (n === 1 ? ' picture a second' : ' pictures a second');
     }
@@ -262,6 +269,15 @@
         ws.onclose = function () {
             if (S.ws === ws) {
                 S.ws = null;
+                // what this page was waiting on may never be answered now (a `moved` that could not be sent, a
+                // preview, a pick's progress); the rejoined page starts clean
+                S.pending = [];
+                S.picking = false;
+                closeRegion();
+                renderStarsUi();
+                if (S.session === 'active') {
+                    renderNumber();
+                }
                 setStartEnabled();
                 reconnectLater();
             }
@@ -465,13 +481,18 @@
 
     // ==== status line ============================================================================================
 
-    function expectedInterval() {
-        var exp = S.mode && typeof S.mode.exposure === 'number' ? S.mode.exposure : 0.1;
-        if (S.intervals.length) {
-            var sorted = S.intervals.slice().sort(function (a, b) { return a - b; });
-            exp = Math.max(exp, sorted[Math.floor(sorted.length / 2)]);
+    function medianInterval() {
+        if (!S.intervals.length) {
+            return null;
         }
-        return exp;
+        var sorted = S.intervals.slice().sort(function (a, b) { return a - b; });
+        return sorted[Math.floor(sorted.length / 2)];
+    }
+
+    function expectedInterval() {
+        var exp = S.mode && typeof S.mode.exposure === 'number' && S.mode.exposure > 0 ? S.mode.exposure : 0.1;
+        var gap = medianInterval();
+        return gap === null ? exp : Math.max(exp, gap);
     }
 
     function renderStatus() {
@@ -486,7 +507,7 @@
         } else if (pending) {
             text = MSG_WAITING[S.pending[S.pending.length - 1].kind];
         } else {
-            text = S.mode ? liveText(S.mode.picture, S.mode.exposure) : '';
+            text = S.mode ? liveText(S.mode.picture, S.mode.exposure, medianInterval()) : '';
         }
         var live = $id('fs-live');
         if (live.getAttribute('data-status') !== state) {
@@ -506,6 +527,8 @@
             text = reason;
         }
         setText($id('fs-mode'), text);
+        // a whole-frame picture (stills rigs) has no region to move
+        show($id('fs-region-btn'), !!(m && Array.isArray(m.roi)));
         if (m) {
             setText($id('fs-exp-btn'), 'Exposure ' + fmtExposure(m.exposure) + ' ▾');
             setText($id('fs-gain-btn'), 'Gain ' + fmtGain(m.gain) + ' ▾');
@@ -822,7 +845,7 @@
     }
 
     function openRegion() {
-        if (S.preview || !S.mode) {
+        if (S.preview || !S.mode || !Array.isArray(S.mode.roi)) {
             return;
         }
         if (!send({kind: 'preview'})) {
