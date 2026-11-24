@@ -718,3 +718,126 @@ def test_slow_preview_never_blocks_commands(link, connect, closers):
     late = [m[1] for m in page.drain() if m[0] == 'json']
     assert not [m for m in late if m.get('kind') == 'preview' or m.get('command') == 'preview']
     assert not [t for t in threading.enumerate() if t.name == 'focus-preview']
+
+
+# --- fix round 1 ---------------------------------------------------------------------------------------------------
+
+def test_huge_int_is_invalid_not_a_crash(session, source):
+    ctrl, page = session
+    huge = int('9' * 400)  # valid JSON; float() of it overflows
+    ctrl.handle(page.cid, {'kind': 'set_camera', 'exposure': huge, 'gain': 1})
+    assert page.json('error', command='set_camera')['message'] == 'Not a valid exposure.'
+    ctrl.handle(page.cid, {'kind': 'min_snr', 'value': -huge})
+    assert page.json('error', command='min_snr')['message'] == 'Not a valid brightness.'
+    assert ctrl.active
+    assert 'set_camera' not in source.kinds()
+
+
+def test_handler_bug_gets_an_error_and_the_session_goes_on(session, source, monkeypatch, caplog):
+    ctrl, page = session
+
+    def broken(cid, msg):
+        raise KeyError('secret-page-input')
+
+    monkeypatch.setattr(ctrl, '_cmd_keep_going', broken)
+    ctrl.handle(page.cid, {'kind': 'keep_going', 'note': 'secret-page-input'})
+    err = page.json('error', command='keep_going')
+    assert err['message'] == controller_mod.MSG_COMMAND_FAILED
+    assert ctrl.active
+    ctrl.handle(page.cid, {'kind': 'ping', 'id': 2})
+    assert page.json('pong')['id'] == 2
+    assert 'note' not in caplog.text
+
+
+def test_failed_start_does_not_take_the_rest_of_the_batch(link, connect, source, closers):
+    def broken(roi, exposure, gain):
+        source.calls.append(('start', roi, exposure, gain))
+        raise RuntimeError('no camera')
+
+    source.start = broken
+    service = FocusService(link, INFO, lambda cid: FocusController(source, link, FakeClock(), RIG, False,
+                                                                   epoch=Epoch(), exposure=1.0, gain=1.0))
+    cid, page = connect()
+    page.client.send({'kind': 'start'})
+    page.client.send({'kind': 'set_region', 'roi': [0, 0, 64, 64]})
+    page.client.send({'kind': 'set_camera', 'exposure': 2.0, 'gain': 1})
+    time.sleep(0.3)  # all three in one poll batch
+    assert service.poll() is False
+    assert page.json('ended')['reason'] == 'failed'
+    for _ in range(5):
+        service.poll()
+    after = [m[1] for m in page.drain() if m[0] == 'json']
+    assert {m['kind'] for m in after} <= {'state', 'error'}
+    assert [m['command'] for m in after if m['kind'] == 'error'] == ['set_region', 'set_camera']
+    assert all(m['session'] == 'idle' for m in after if m['kind'] == 'state')
+    assert source.kinds() == ['start', 'stop']  # never restarted
+
+
+def test_ended_controller_refuses_commands(connect, make, source):
+    cid, page = connect()
+
+    def broken(roi, exposure, gain):
+        raise RuntimeError('no camera')
+
+    source.start = broken
+    ctrl = make()
+    ctrl.begin(cid)
+    page.json('ended')
+    ctrl.handle(cid, {'kind': 'set_region', 'roi': [0, 0, 64, 64]})
+    assert page.json('error', command='set_region')['message'] == controller_mod.MSG_NO_SESSION
+    assert source.kinds() == ['stop']
+
+
+def test_pick_keeps_every_star(session, source, epoch):
+    ctrl, page = session
+    many = synth.grid_stars(SHAPE, 1.5, 20000, spacing=30, margin=30)
+    assert len(many) > 20
+    stars = run_pick(ctrl, page, source, epoch, stars=many)
+    assert len(stars['stars']) == len(many)
+
+
+def test_grading_covers_about_4_s_with_no_cap(session, source, epoch):
+    ctrl, page = session
+    exposure = 0.25  # 4 s is 16 frames: more than the old cap of 10
+    epoch.t = 1000.0
+    ctrl.handle(page.cid, {'kind': 'pick_stars'})
+    for n in range(1, 17):
+        source.frames.put(raw_frame(GRID, t_end=1000.0 + exposure * n, exposure=exposure))
+        reading(page, n, ctrl)
+        ctrl.service()
+        got = [m for m in page.drain(0.05) if m[0] == 'json' and m[1].get('kind') == 'stars']
+        if n < 16:
+            assert not got, 'graded after {0:d} frames'.format(n)
+    assert len(got) == 1 and len(got[0][1]['stars']) == len(GRID)
+
+
+def test_preview_released_by_a_region_change_is_quiet(session, source, monkeypatch, caplog):
+    ctrl, page = session
+    slow = SlowWholeSource()
+    ctrl.source = slow
+    ctrl.handle(page.cid, {'kind': 'preview'})
+    assert slow.waiting.wait(2.0)
+    ctrl.handle(page.cid, {'kind': 'set_region', 'roi': [0, 0, 64, 64]})
+    page.json('mode')
+    assert wait_for(lambda: not ctrl._preview_thread.is_alive())
+    for _ in range(5):
+        ctrl.service()
+    msgs = [m[1] for m in page.drain() if m[0] == 'json']
+    assert not [m for m in msgs if m.get('kind') == 'preview' or m.get('command') == 'preview']
+    assert not [r for r in caplog.records if r.levelname == 'ERROR']
+
+
+def test_preview_before_any_frame_uses_the_source_bayer(session, source, monkeypatch):
+    ctrl, page = session
+    source.bayer = 'rggb'
+    seen = []
+    real = controller_mod.to_gray
+
+    def spy(raw, bayer):
+        seen.append(bayer)
+        return real(raw, bayer)
+
+    monkeypatch.setattr(controller_mod, 'to_gray', spy)
+    ctrl.handle(page.cid, {'kind': 'preview'})
+    page.json('preview', pump=ctrl.service)
+    assert seen == ['RGGB']

@@ -54,6 +54,7 @@ class PictureSource(Protocol):
     """What the controller needs from a camera during a session."""
 
     frames: 'queue.Queue[RawFrame]'
+    bayer: Optional[str]  # optional: the pattern of the last picture, for a whole_frame taken before any frame
 
     def start(self, roi: Optional[Roi], exposure: float, gain: float) -> None:
         ...
@@ -113,8 +114,9 @@ def load_still(filename: str) -> Tuple[np.ndarray, float, Optional[str]]:
             data = np.array(hdulist[0].data)
             bitpix = int(header['BITPIX'])
             bayer = normalise_bayer(header.get('BAYERPAT'))
-        if data.ndim == 3:  # a colour FITS holds planes; focus on their mean
+        if data.ndim == 3:  # a colour FITS holds planes; focus on their mean, which is no longer a mosaic
             data = data.mean(axis=0)
+            bayer = None
         return data, 255.0 if bitpix == 8 else 65535.0, bayer
 
     if name.endswith('.dng'):
@@ -180,6 +182,7 @@ class StillsSource(object):
         self._exposure = 0.0
         self._gain = 0.0
         self._last_full = None
+        self.bayer = None         # the Bayer pattern of the last picture (None before one, or mono)
 
     def start(self, roi, exposure, gain):
         if self._running:
@@ -220,16 +223,20 @@ class StillsSource(object):
                 return
             self._running = False
             self._lock.notify_all()
+        # The stills thread may be between its running check and setCcdExposure. Wait for it to finish first, so
+        # the abort below catches any exposure it starts, and that picture never reaches capture's own queue.
+        self._jobs.put(None)
+        if self._thread is not None and self._thread is not threading.current_thread():
+            self._thread.join(JOIN_TIMEOUT_S)
+            if self._thread.is_alive():
+                logger.error('Focus stills: the stills thread did not stop within %.0f s', JOIN_TIMEOUT_S)
+        self._thread = None
         try:
             self.camera.abortCcdExposure()
         except Exception:
             logger.exception('Focus stills: abort failed')
         self._swap(self._old_q)
         self._old_q = None
-        self._jobs.put(None)
-        if self._thread is not None and self._thread is not threading.current_thread():
-            self._thread.join(JOIN_TIMEOUT_S)
-        self._thread = None
 
     # -- internals ---------------------------------------------------------------------------------------------------
 
@@ -285,6 +292,7 @@ class StillsSource(object):
             _remove(jobdata)
         with self._lock:
             self._last_full = raw
+            self.bayer = bayer
             roi = self._roi
             self._lock.notify_all()
         self.frames.put(RawFrame(

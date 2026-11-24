@@ -120,10 +120,8 @@ JOIN_TIMEOUT_S = 5.0
 MAX_FRAME_FAILURES = 5
 MEASURE_SWITCH_FRAMES = 5     # a new measure must win this many frames in a row (§12 item 7)
 PICK_FRAMES = 3
-PICK_MAX_STARS = 20
-GRADE_SECONDS = 4.0           # grade over about 4 s of frames, at least 3 and at most 10
+GRADE_SECONDS = 4.0           # grade over about 4 s of single frames (amendment 9), and at least 3
 GRADE_MIN_FRAMES = 3
-GRADE_MAX_FRAMES = 10
 MOVE_SETTLE_S = 0.5
 MIN_SNR_RANGE = (3.0, 60.0)
 MAX_EXPOSURE_S = 3600.0
@@ -134,6 +132,7 @@ CMD_ID_MAX = 2 ** 32 - 1
 MSG_CONTROLS = 'Only a page with controls can do that.'
 MSG_NO_SESSION = 'No focus session is running.'
 MSG_UNKNOWN = 'Unknown command.'
+MSG_COMMAND_FAILED = 'That did not work. The focus session goes on.'
 MSG_INVALID = 'Not a valid {0}.'
 MSG_PICK_BUSY = 'Wait for the star pick to finish.'
 MSG_PICK_WAIT = 'Picking stars: waiting for a new picture'
@@ -168,9 +167,14 @@ def _rig_dict(rig) -> dict:
 
 
 def _num(v, name, low=None, high=None, low_open=False) -> float:
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
         raise _Invalid(name)
-    v = float(v)
+    try:
+        v = float(v)  # an int too large for a float (valid JSON) raises OverflowError
+    except (OverflowError, TypeError, ValueError):
+        raise _Invalid(name) from None
+    if not math.isfinite(v):
+        raise _Invalid(name)
     if low is not None and (v < low or (low_open and v == low)):
         raise _Invalid(name)
     if high is not None and v > high:
@@ -270,6 +274,7 @@ class FocusController(object):
         self._stop = threading.Event()
         self._thread = None
         self._preview_thread = None
+        self._restarts = 0        # source restarts by set_region (under _lock)
 
         # worker-only state
         self._frame_no = 0
@@ -321,6 +326,8 @@ class FocusController(object):
         self._stop.set()
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(JOIN_TIMEOUT_S)
+            if self._thread.is_alive():
+                logger.error('Focus: the worker did not stop within %.0f s', JOIN_TIMEOUT_S)
         try:
             self.source.stop()  # also releases a waiting whole_frame()
         except Exception:
@@ -375,7 +382,11 @@ class FocusController(object):
     # -- commands --------------------------------------------------------------------------------------------------
 
     def handle(self, client_id: int, msg: dict) -> None:
+        """One command from a page. Never raises: a bad command gets an `error` and the session goes on."""
         kind = msg.get('kind') if isinstance(msg, dict) else None
+        if not self._active and kind not in OPEN_COMMANDS:
+            self._error(client_id, kind, MSG_NO_SESSION)  # ended (a failed start, say) but not yet reaped
+            return
         if kind not in OPEN_COMMANDS and not self._controls(client_id):
             self._error(client_id, kind, MSG_CONTROLS)
             return
@@ -390,6 +401,11 @@ class FocusController(object):
             handler(client_id, msg)
         except _Invalid as e:
             self._error(client_id, kind, MSG_INVALID.format(e.args[0]))
+        except Exception:
+            # a bug, not a camera fault (source errors end the session in _source_call): keep the session for
+            # every page and tell this one. The message is not logged: it is page input.
+            logger.exception('Focus: the %s command failed', kind)
+            self._error(client_id, kind, MSG_COMMAND_FAILED)
 
     def _cmd_ping(self, cid, msg):
         self.link.send_json(cid, {'kind': 'pong', 't': time.time(), 'id': msg.get('id')})
@@ -438,6 +454,7 @@ class FocusController(object):
                 self.ledger.begin(cmd_id)
             cancelled = self._pick_press is not None
             self._clear_stars_locked()
+            self._restarts += 1  # before the stop: a preview it releases knows it was superseded
         if not self._source_call('stop', self.source.stop):
             return
         _drain(self.source.frames)
@@ -462,21 +479,34 @@ class FocusController(object):
         if self._preview_thread is not None and self._preview_thread.is_alive():
             self._error(cid, 'preview', MSG_PREVIEW_BUSY)
             return
-        bayer, _ = self._last_format  # the region crop keeps the Bayer phase, so the stream's pattern holds
-        self._preview_thread = threading.Thread(target=self._take_preview, args=(cid, bayer), name='focus-preview',
-                                                daemon=True)
+        with self._lock:
+            restarts = self._restarts
+        self._preview_thread = threading.Thread(target=self._take_preview, args=(cid, restarts),
+                                                name='focus-preview', daemon=True)
         self._preview_thread.start()
 
-    def _take_preview(self, cid, bayer):
+    def _take_preview(self, cid, restarts):
         """On the focus-preview thread: wait for the whole sensor, make the reply, post it for service()."""
         try:
-            reply = self._preview_msg(self.source.whole_frame(), bayer)
+            raw = self.source.whole_frame()
+            reply = self._preview_msg(raw, self._preview_bayer())
         except Exception:
-            if self._stop.is_set():
-                return  # the session ended under it
+            with self._lock:
+                superseded = self._restarts != restarts
+            if self._stop.is_set() or superseded:
+                # the session ended, or a region change restarted the source: expected, and nothing to say
+                logger.info('Focus: whole-sensor picture abandoned (%s)', 'ended' if self._stop.is_set() else
+                            'the region moved')
+                return
             logger.exception('Focus: whole-sensor picture failed')
             reply = None
         self._post(('preview', cid, reply))
+
+    def _preview_bayer(self):
+        """The Bayer pattern for the whole sensor: the source's, else the stream's (the region crop keeps the
+        Bayer phase). None before any picture or for mono."""
+        known = normalise_bayer(getattr(self.source, 'bayer', None))
+        return known if known is not None else self._last_format[0]
 
     @staticmethod
     def _preview_msg(raw, bayer):
@@ -856,14 +886,13 @@ class FocusController(object):
                                       'done': False, 'frame': k, 'of': PICK_FRAMES, 'candidates': len(found)})
             if k < PICK_FRAMES:
                 return
-            p.cands = found[:PICK_MAX_STARS]
+            p.cands = found  # every star, brightest first (amendment 9)
             p.stack = None
             if not p.cands:
                 self._post(('pick_failed', p.gen, MSG_PICK_NONE))
                 self._pick = None
                 return
-            p.need = min(max(int(round(GRADE_SECONDS / max(frame.exposure, 1e-6))), GRADE_MIN_FRAMES),
-                         GRADE_MAX_FRAMES)
+            p.need = max(int(math.ceil(GRADE_SECONDS / max(frame.exposure, 1e-3) - 1e-9)), GRADE_MIN_FRAMES)
             p.snrs = [[] for _ in p.cands]
             p.peaks = [[] for _ in p.cands]
             stacked, p.frames = p.frames, []
@@ -934,6 +963,7 @@ class FocusService(object):
                 self.controller = controller
                 controller.begin(cid)
                 started = controller.active  # False when the source failed to start
+                self._reap()  # a failed start must not take the rest of this batch
             else:
                 self._error(cid, kind, MSG_NO_SESSION)
 

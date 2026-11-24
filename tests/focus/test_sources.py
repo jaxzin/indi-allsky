@@ -264,3 +264,66 @@ def test_whole_frame_ends_when_the_source_stops(camera, source):
     t.join(2.0)
     assert not t.is_alive()
     assert [type(e) for e in errors] == [RuntimeError]
+
+
+class LateCamera(FakeCamera):
+    """An exposure starts when setCcdExposure returns, and lands on whatever image_q the camera holds then
+    unless an abort came after it."""
+
+    def __init__(self):
+        super().__init__()
+        self.gate = threading.Event()
+        self.entered = threading.Event()
+        self.pending = False
+        self.events = []
+
+    def setCcdExposure(self, exposure, gain, binning, sync=False, timeout=None, sqm_exposure=False):
+        if self.exposures:  # the first comes from start(); hold the ones the stills thread starts
+            self.entered.set()
+            self.gate.wait(5.0)
+        super().setCcdExposure(exposure, gain, binning, sync)
+        self.pending = True
+        self.events.append('expose')
+
+    def abortCcdExposure(self):
+        super().abortCcdExposure()
+        self.pending = False
+        self.events.append('abort')
+
+    def finish(self, path):
+        if self.pending:
+            self.pending = False
+            self.image_q.put(job(path))
+
+
+def test_stop_waits_for_an_exposure_being_started(tmp_path):
+    camera = LateCamera()
+    original = camera.image_q
+    src = StillsSource(camera, camera.swap)
+    src.start(None, 1.0, 100.0)
+    camera.image_q.put(job(write_fits(tmp_path / 'a.fit', mosaic())))
+    src.frames.get(timeout=2.0)
+    assert camera.entered.wait(2.0)  # past the running check, about to start an exposure
+    threading.Timer(0.2, camera.gate.set).start()  # it starts once stop() is under way
+    src.stop()
+    assert camera.events[-1] == 'abort'  # no exposure started after the abort
+    n = len(camera.exposures)
+    camera.finish(write_fits(tmp_path / 'late.fit', mosaic()))
+    time.sleep(0.1)
+    assert len(camera.exposures) == n
+    assert original.empty()
+
+
+def test_colour_fits_is_not_a_mosaic(tmp_path):
+    planes = np.stack([mosaic(seed=s) for s in (1, 2, 3)])
+    raw, _, bayer = load_still(write_fits(tmp_path / 'c.fit', planes))
+    assert raw.ndim == 2
+    assert bayer is None
+
+
+def test_source_knows_the_bayer_of_its_last_picture(tmp_path, camera, source):
+    assert source.bayer is None
+    source.start(None, 1.0, 100.0)
+    camera.image_q.put(job(write_fits(tmp_path / 'a.fit', mosaic())))
+    source.frames.get(timeout=2.0)
+    assert source.bayer == 'RGGB'
