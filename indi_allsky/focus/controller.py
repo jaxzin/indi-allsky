@@ -9,10 +9,26 @@ when it falls behind it skips to the newest waiting frame (frame numbers still c
     hot-pixel fix -> gray -> measure (picked stars) or detect (star count) -> preview copy -> clock -> JPEG
     -> link.broadcast_frame, then link.broadcast_json(reading)
 
-Threading: every call into the source and every change of session state happens on the caller's thread (`handle`,
-`service`, `begin`, `end`). The worker never calls the source; it posts requests (a pick result, an exposure-search
-step, a failure) that `service()` applies. `_lock` covers the rules, the ledger, the star set and the generation
-counters; the worker takes it once per frame, only to copy a snapshot.
+Threading: every change of session state happens on the caller's thread (`handle`, `service`, `begin`, `end`), and so
+does every call into the source but one. The worker never calls the source; it posts requests (a pick result, an
+exposure-search step, a failure) that `service()` applies. `_lock` covers the rules, the ledger, the star set and the
+generation counters; the worker takes it once per frame, only to copy a snapshot.
+
+The one exception is `source.whole_frame()`, which can wait many seconds for a picture. A `focus-preview` thread makes
+that call and the JPEG, then posts the reply for `service()` to send, so commands (`ping`, `done`) are answered and the
+session rules keep ticking meanwhile. One preview at a time: a second `preview` while one is pending gets an `error`.
+`end()` stops the source, which releases a waiting `whole_frame()`, and joins the thread; a reply still pending then is
+dropped, so nothing follows `ended`.
+
+Saturated stars: a star whose raw peak reaches SATURATION_FRACTION (0.98) of full scale is clipped, so its measured
+size is wrong. The peak is the maximum of the hot-pixel-fixed raw (before gray) in a MEASURE_BOX square around the
+star. It is checked twice:
+  - at the pick, as the median peak over the grading frames. Such a star stays in the set with the state `saturated`
+    in the `stars` message, so the page can show why it is not used. It is not dropped, because a shorter exposure
+    can bring it back: the per-frame check below decides each frame.
+  - on every frame: a star clipped in that frame never adds to `size`, whatever its state, and its ring says
+    `saturated`. A star marked `saturated` at the pick counts again on a frame where it is not clipped. When no star
+    is used and a wanted one was clipped, the reading's message is MSG_SATURATED.
 
 A page may command only when the hello it registered with carries `'controls': True`. `ping` and `hello` are open to
 every page; every other command is refused to a watcher with an `error`.
@@ -25,7 +41,7 @@ Messages from a page (`kind` and fields):
     keep_going                      reset the idle timer
     set_camera  exposure, gain, cmd_id?      exposure in s (0 < e <= 3600), gain >= 0
     set_region  roi: [x, y, w, h] | null, cmd_id?   snapped to the Bayer grid (even x, y, w, h)
-    preview                         -> preview
+    preview                         -> preview, later (one at a time; `error` while one is pending)
     pick_stars                      stack 3 frames begun after the press, pick, grade
     star        id, state: keep | drop | pin        pin is exclusive
     min_snr     value               clamped to 3..60
@@ -40,9 +56,11 @@ Messages to a page:
     reading   frame, cmd_id, capture_time, exposure, gain, width, height (gray px; the JPEG is half size),
               measure ('stars' | 'contrast' | 'none'), stars_visible (count before a pick, else null),
               size (median of the used stars, px, or null), stars_used, contrast (or null),
-              rings [{id, x, y, size, snr, state}] (size and snr null when the star was not found), message (or null)
+              rings [{id, x, y, size, snr, state}] (size and snr null when the star was not found; state as in
+              `stars`, but `saturated` only when this frame clipped the star), message (or null)
     measure   measure (sent when the measure switches)
-    stars     stars [{id, x, y, snr1, state: kept | weak | dropped | pinned}], min_snr
+    stars     stars [{id, x, y, snr1, state: kept | weak | saturated | dropped | pinned}], min_snr
+              (precedence: pinned, dropped, saturated, then kept or weak by snr1)
     progress  what ('pick' | 'exposure_search'), message, done; pick also: frame, of, candidates
     preview   jpeg (base64), width, height (the whole sensor, px), jpeg_width, jpeg_height
     error     message, command
@@ -76,6 +94,7 @@ from indi_allsky.focus.frame import encode_jpeg
 from indi_allsky.focus.frame import pack_frame
 from indi_allsky.focus.frame import preview
 from indi_allsky.focus.measure import DEFAULT_MIN_SNR
+from indi_allsky.focus.measure import MEASURE_BOX
 from indi_allsky.focus.measure import Candidate
 from indi_allsky.focus.measure import Tracker
 from indi_allsky.focus.measure import contrast_score
@@ -109,6 +128,7 @@ MOVE_SETTLE_S = 0.5
 MIN_SNR_RANGE = (3.0, 60.0)
 MAX_EXPOSURE_S = 3600.0
 PREVIEW_MAX_PX = 1024
+SATURATION_FRACTION = 0.98    # a raw peak at or above this share of full scale is clipped
 CMD_ID_MAX = 2 ** 32 - 1
 
 MSG_CONTROLS = 'Only a page with controls can do that.'
@@ -125,6 +145,8 @@ MSG_VISIBLE = 'About {0:d} stars visible · press Pick stars to measure'
 MSG_OVER = 'The picture is over-exposed. Try a shorter exposure.'
 MSG_LOST = 'None of the picked stars is in this picture.'
 MSG_PREVIEW_FAILED = 'Could not take a whole-sensor picture.'
+MSG_PREVIEW_BUSY = 'A whole-sensor picture is already on its way.'
+MSG_SATURATED = 'The picked stars are saturated. Try a shorter exposure.'
 
 OPEN_COMMANDS = ('ping', 'hello')
 
@@ -188,16 +210,25 @@ def _f(v) -> Optional[float]:
     return v if math.isfinite(v) else None
 
 
+def _peak(raw, x, y) -> float:
+    """The brightest raw value in the measure box around (x, y)."""
+    half = MEASURE_BOX // 2
+    xi, yi = int(round(x)), int(round(y))
+    box = raw[max(0, yi - half):yi + half + 1, max(0, xi - half):xi + half + 1]
+    return float(box.max()) if box.size else 0.0
+
+
 class _Pick(object):
     """The worker's star pick in progress: stack frames begun after `press`, then grade the picked stars."""
 
     def __init__(self, gen, press):
         self.gen = gen
         self.press = press
-        self.grays = []
+        self.frames = []          # (gray, hot-pixel-fixed raw, saturation level) of each stacked frame
         self.stack = None
         self.cands = None
         self.snrs = None
+        self.peaks = None         # per candidate: its raw peak over the saturation level, per grading frame
         self.need = GRADE_MIN_FRAMES
 
 
@@ -221,7 +252,7 @@ class FocusController(object):
         self._lock = threading.Lock()
         self.rules = SessionRules(clock)
         self.ledger = CommandLedger(clock=epoch)
-        self._stars = []          # [{'id', 'x', 'y', 'snr1', 'choice': keep | drop | pin}]
+        self._stars = []          # [{'id', 'x', 'y', 'snr1', 'saturated', 'choice': keep | drop | pin}]
         self._stars_gen = 0
         self._min_snr = DEFAULT_MIN_SNR
         self._region_gen = 0
@@ -238,6 +269,7 @@ class FocusController(object):
         self._requests = queue.Queue()
         self._stop = threading.Event()
         self._thread = None
+        self._preview_thread = None
 
         # worker-only state
         self._frame_no = 0
@@ -290,9 +322,14 @@ class FocusController(object):
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(JOIN_TIMEOUT_S)
         try:
-            self.source.stop()
+            self.source.stop()  # also releases a waiting whole_frame()
         except Exception:
             logger.exception('Focus: the picture source failed to stop')
+        pending = self._preview_thread
+        if pending is not None and pending is not threading.current_thread():
+            pending.join(JOIN_TIMEOUT_S)
+            if pending.is_alive():
+                logger.error('Focus: the whole-sensor picture did not stop')
         self.link.broadcast_json({'kind': 'ended', 'reason': reason})
 
     def service(self) -> None:
@@ -422,13 +459,27 @@ class FocusController(object):
         self.link.broadcast_json(self._mode_msg())
 
     def _cmd_preview(self, cid, msg):
-        try:
-            raw = self.source.whole_frame()
-        except Exception:
-            logger.exception('Focus: whole-sensor picture failed')
-            self._error(cid, 'preview', MSG_PREVIEW_FAILED)
+        if self._preview_thread is not None and self._preview_thread.is_alive():
+            self._error(cid, 'preview', MSG_PREVIEW_BUSY)
             return
         bayer, _ = self._last_format  # the region crop keeps the Bayer phase, so the stream's pattern holds
+        self._preview_thread = threading.Thread(target=self._take_preview, args=(cid, bayer), name='focus-preview',
+                                                daemon=True)
+        self._preview_thread.start()
+
+    def _take_preview(self, cid, bayer):
+        """On the focus-preview thread: wait for the whole sensor, make the reply, post it for service()."""
+        try:
+            reply = self._preview_msg(self.source.whole_frame(), bayer)
+        except Exception:
+            if self._stop.is_set():
+                return  # the session ended under it
+            logger.exception('Focus: whole-sensor picture failed')
+            reply = None
+        self._post(('preview', cid, reply))
+
+    @staticmethod
+    def _preview_msg(raw, bayer):
         gray = to_gray(raw, bayer)
         img = preview(gray, Stretch.from_frame(gray))
         longest = max(img.shape[:2])
@@ -437,14 +488,14 @@ class FocusController(object):
             img = cv2.resize(img, (max(1, int(img.shape[1] * f)), max(1, int(img.shape[0] * f))),
                              interpolation=cv2.INTER_AREA)
         # width and height are the sensor's: the page maps the region it draws on the JPEG back to sensor px
-        self.link.send_json(cid, {
+        return {
             'kind': 'preview',
             'jpeg': base64.b64encode(encode_jpeg(img)).decode('ascii'),
             'width': int(raw.shape[1]),
             'height': int(raw.shape[0]),
             'jpeg_width': int(img.shape[1]),
             'jpeg_height': int(img.shape[0]),
-        })
+        }
 
     def _cmd_pick_stars(self, cid, msg):
         with self._lock:
@@ -520,11 +571,13 @@ class FocusController(object):
             'roi': list(self.roi) if self.roi is not None else None,
         }
 
-    def _star_state(self, s) -> str:
+    def _star_state(self, s, saturation=True) -> str:
         if s['choice'] == 'pin':
             return 'pinned'
         if s['choice'] == 'drop':
             return 'dropped'
+        if saturation and s['saturated']:
+            return 'saturated'
         return grade(s['snr1'], self._min_snr)
 
     def _stars_msg(self):
@@ -563,14 +616,20 @@ class FocusController(object):
             with self._lock:
                 if gen != self._pick_gen:
                     return
-                self._stars = [{'id': i, 'x': x, 'y': y, 'snr1': snr1, 'choice': 'keep'}
-                               for i, (x, y, snr1) in enumerate(found)]
+                self._stars = [{'id': i, 'x': x, 'y': y, 'snr1': snr1, 'saturated': sat, 'choice': 'keep'}
+                               for i, (x, y, snr1, sat) in enumerate(found)]
                 self._stars_gen += 1
                 self._pick_press = None
             self.link.broadcast_json(self._stars_msg())
             self.link.broadcast_json({'kind': 'progress', 'what': 'pick', 'message': MSG_PICKED.format(len(found)),
                                       'done': True, 'frame': PICK_FRAMES, 'of': PICK_FRAMES,
                                       'candidates': len(found)})
+        elif what == 'preview':
+            _, cid, reply = request
+            if reply is None:
+                self._error(cid, 'preview', MSG_PREVIEW_FAILED)
+            else:
+                self.link.send_json(cid, reply)
         elif what == 'pick_failed':
             _, gen, message = request
             with self._lock:
@@ -627,7 +686,8 @@ class FocusController(object):
     def _snapshot(self, exposure_start):
         with self._lock:
             return {
-                'stars': [(s['id'], s['x'], s['y'], self._star_state(s)) for s in self._stars],
+                # the state without the pick's saturation mark: each frame checks clipping for itself
+                'stars': [(s['id'], s['x'], s['y'], self._star_state(s, saturation=False)) for s in self._stars],
                 'stars_gen': self._stars_gen,
                 'region_gen': self._region_gen,
                 'region_since': self._region_since,
@@ -659,7 +719,9 @@ class FocusController(object):
         step = 2 if bayer else 1
         if self._hot is None:
             self._hot = find_hot_pixels(raw, step)
-        gray = to_gray(fix_hot_pixels(raw, self._hot, step), bayer)
+        fixed = fix_hot_pixels(raw, self._hot, step)
+        gray = to_gray(fixed, bayer)
+        clip = SATURATION_FRACTION * full_scale
         sigma = noise_sigma(gray)
         level = brightness(gray, full_scale)
         height, width = gray.shape[:2]
@@ -681,12 +743,16 @@ class FocusController(object):
             pinned = [sid for sid, _, _, state in snap['stars'] if state == 'pinned']
             use = set(pinned) if pinned else {sid for sid, _, _, state in snap['stars'] if state == 'kept'}
             sizes = []
+            clipped = False
             for i, (sid, _, _, state) in enumerate(snap['stars']):
                 m = got.get(i)
                 x, y = (m.x, m.y) if m is not None else positions[i]
+                saturated = state != 'dropped' and _peak(fixed, x, y) >= clip
                 rings.append({'id': sid, 'x': _f(x), 'y': _f(y), 'size': _f(m.size) if m else None,
-                              'snr': _f(m.snr) if m else None, 'state': state})
-                if m is not None and sid in use and math.isfinite(m.size):
+                              'snr': _f(m.snr) if m else None, 'state': 'saturated' if saturated else state})
+                if sid in use and saturated:
+                    clipped = True
+                elif m is not None and sid in use and math.isfinite(m.size):
                     sizes.append(m.size)
             used = len(sizes)
             size = _f(statistics.median(sizes)) if sizes else None
@@ -698,14 +764,19 @@ class FocusController(object):
 
         contrast = _f(contrast_score(gray)) if measure == 'contrast' else None
         if measure == 'stars':
-            message = (MSG_LOST if used == 0 else None) if picked else MSG_VISIBLE.format(count)
+            if not picked:
+                message = MSG_VISIBLE.format(count)
+            elif used == 0:
+                message = MSG_SATURATED if clipped else MSG_LOST
+            else:
+                message = None
         elif measure == 'none':
             message = MSG_OVER if level == 'over' else MSG_NO_STARS
         else:
             message = None
 
         # -- picking and the exposure search ---------------------------------------------------------------------------
-        self._step_pick(snap, frame, gray, sigma, exposure_start)
+        self._step_pick(snap, frame, gray, fixed, clip, sigma, exposure_start)
         if (self._search is not None and snap['search_on'] and not self._search_done and not picked
                 and self._pick is None and math.isclose(frame.exposure, self._search.exposure)):
             s = self._search.step(count, level)
@@ -764,7 +835,7 @@ class FocusController(object):
             self.link.broadcast_json({'kind': 'measure', 'measure': self._measure})
         return self._measure
 
-    def _step_pick(self, snap, frame, gray, sigma, exposure_start):
+    def _step_pick(self, snap, frame, gray, fixed, clip, sigma, exposure_start):
         if snap['pick_gen'] != self._seen_pick_gen:
             self._seen_pick_gen = snap['pick_gen']
             self._pick = _Pick(snap['pick_gen'], snap['pick_press']) if snap['pick_press'] is not None else None
@@ -777,8 +848,8 @@ class FocusController(object):
                 return
             g = gray.astype(np.float64)
             p.stack = g if p.stack is None else p.stack + g
-            p.grays.append(gray)
-            k = len(p.grays)
+            p.frames.append((gray, fixed, clip))
+            k = len(p.frames)
             found = pick(p.stack / k)
             self.link.broadcast_json({'kind': 'progress', 'what': 'pick',
                                       'message': MSG_PICKING.format(k, PICK_FRAMES, len(found)),
@@ -794,22 +865,25 @@ class FocusController(object):
             p.need = min(max(int(round(GRADE_SECONDS / max(frame.exposure, 1e-6))), GRADE_MIN_FRAMES),
                          GRADE_MAX_FRAMES)
             p.snrs = [[] for _ in p.cands]
-            grays, p.grays = p.grays, []
-            for g in grays:
-                self._grade_frame(p, g, noise_sigma(g))
+            p.peaks = [[] for _ in p.cands]
+            stacked, p.frames = p.frames, []
+            for g, f, c in stacked:
+                self._grade_frame(p, g, f, c, noise_sigma(g))
         else:
-            self._grade_frame(p, gray, sigma)
+            self._grade_frame(p, gray, fixed, clip, sigma)
 
         if len(p.snrs[0]) >= p.need:
-            found = [(float(c.x), float(c.y), float(statistics.median(s))) for c, s in zip(p.cands, p.snrs)]
+            found = [(float(c.x), float(c.y), float(statistics.median(s)), bool(statistics.median(k) >= 1.0))
+                     for c, s, k in zip(p.cands, p.snrs, p.peaks)]
             self._post(('stars', p.gen, found))
             self._pick = None
 
     @staticmethod
-    def _grade_frame(p, gray, sigma):
-        for c, snrs in zip(p.cands, p.snrs):
+    def _grade_frame(p, gray, fixed, clip, sigma):
+        for c, snrs, peaks in zip(p.cands, p.snrs, p.peaks):
             m = measure_star(gray, c.x, c.y, sigma)
             snrs.append(max(float(m.snr), 0.0) if m is not None and math.isfinite(m.snr) else 0.0)
+            peaks.append(_peak(fixed, c.x, c.y) / clip)  # >= 1 when clipped
 
 
 def _drain(q):

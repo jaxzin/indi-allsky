@@ -62,10 +62,11 @@ class PictureSource(Protocol):
         """New exposure and gain. A video source restarts its stream (spec amendment 5)."""
 
     def whole_frame(self) -> np.ndarray:
-        """One full-sensor picture, for Move region."""
+        """One full-sensor picture, for Move region. Called on its own thread while the session runs; it may wait
+        for a picture, and must raise once `stop()` is called rather than keep waiting."""
 
     def stop(self) -> None:
-        ...
+        """Stop the pictures, and release a `whole_frame` that is waiting."""
 
 
 def normalise_bayer(bayer) -> Optional[str]:
@@ -200,10 +201,13 @@ class StillsSource(object):
             self._gain = float(gain)
 
     def whole_frame(self, timeout=WHOLE_FRAME_TIMEOUT_S):
-        """The last full-sensor picture (stills are always taken whole and cropped here)."""
+        """The last full-sensor picture (stills are always taken whole and cropped here). Raises RuntimeError when
+        the source stops before one arrives."""
         deadline = time.monotonic() + timeout
         with self._lock:
             while self._last_full is None:
+                if not self._running:
+                    raise RuntimeError('the picture source stopped')
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError('no picture yet')

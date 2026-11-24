@@ -245,3 +245,22 @@ def test_whole_frame_times_out_without_a_picture(camera, source):
     source.start(None, 1.0, 100.0)
     with pytest.raises(TimeoutError):
         source.whole_frame(timeout=0.05)
+
+
+def test_whole_frame_ends_when_the_source_stops(camera, source):
+    source.start(None, 1.0, 100.0)
+    errors = []
+
+    def wait():
+        try:
+            source.whole_frame(timeout=10.0)
+        except Exception as e:
+            errors.append(e)
+
+    t = threading.Thread(target=wait)
+    t.start()
+    time.sleep(0.1)
+    source.stop()
+    t.join(2.0)
+    assert not t.is_alive()
+    assert [type(e) for e in errors] == [RuntimeError]

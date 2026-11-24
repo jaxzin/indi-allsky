@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import queue
+import statistics
+import threading
 import time
 
 import numpy as np
@@ -442,7 +444,7 @@ def test_set_region_restarts_source_and_clears_stars(session, source, epoch):
 def test_preview_sends_whole_frame(session, source):
     ctrl, page = session
     ctrl.handle(page.cid, {'kind': 'preview'})
-    msg = page.json('preview')
+    msg = page.json('preview', pump=ctrl.service)
     assert (msg['width'], msg['height']) == SHAPE[::-1]
     assert msg['jpeg']
 
@@ -629,3 +631,90 @@ def test_service_start_that_fails_returns_false(link, connect, source):
     assert idle['session'] == 'idle'
     assert True not in results
     assert len(made) == 1 and service.controller is None
+
+
+def test_saturated_star_never_counts(session, source, epoch):
+    ctrl, page = session
+    stars = list(GRID)
+    bright = stars[5]
+    stars[5] = synth.Star(bright.x, bright.y, bright.sigma, 3e6)  # clips at 65535 in the raw
+    picked = run_pick(ctrl, page, source, epoch, stars=stars)
+    states = {s['id']: s['state'] for s in picked['stars']}
+    sat = [i for i, state in states.items() if state == 'saturated']
+    assert len(sat) == 1
+    (sat_id,) = sat
+    star = next(s for s in picked['stars'] if s['id'] == sat_id)
+    assert (star['x'], star['y']) == (pytest.approx(bright.x, abs=1.0), pytest.approx(bright.y, abs=1.0))
+
+    source.frames.put(raw_frame(stars, t_end=1010.0, exposure=2.0))
+    r = reading(page, 4, ctrl)
+    rings = {ring['id']: ring for ring in r['rings']}
+    assert rings[sat_id]['state'] == 'saturated'
+    others = [ring['size'] for i, ring in rings.items() if i != sat_id and ring['state'] == 'kept']
+    assert r['stars_used'] == len(others) > 0
+    assert r['size'] == pytest.approx(statistics.median(others))
+
+    # pinned, it is still left out, and the page says why
+    ctrl.handle(page.cid, {'kind': 'star', 'id': sat_id, 'state': 'pin'})
+    page.json('stars')
+    source.frames.put(raw_frame(stars, t_end=1012.0, exposure=2.0))
+    r = reading(page, 5, ctrl)
+    assert r['stars_used'] == 0
+    assert r['size'] is None
+    assert r['message'] == controller_mod.MSG_SATURATED
+    assert {ring['id']: ring['state'] for ring in r['rings']}[sat_id] == 'saturated'
+
+
+class SlowWholeSource(FakeSource):
+    """whole_frame waits until released or stopped, like a stills source with no picture yet."""
+
+    def __init__(self):
+        super().__init__()
+        self.release = threading.Event()
+        self.waiting = threading.Event()
+        self.stopped = False
+
+    def whole_frame(self):
+        self.calls.append(('whole_frame',))
+        self.waiting.set()
+        self.release.wait(10.0)
+        if self.stopped:
+            raise RuntimeError('stopped')
+        return self.whole
+
+    def stop(self):
+        super().stop()
+        self.stopped = True
+        self.release.set()
+
+
+def test_slow_preview_never_blocks_commands(link, connect, closers):
+    source = SlowWholeSource()
+
+    def make_controller(cid):
+        ctrl = FocusController(source, link, FakeClock(), RIG, False, epoch=Epoch(), exposure=1.0, gain=1.0)
+        closers.append(_Ender(ctrl))
+        return ctrl
+
+    service = FocusService(link, INFO, make_controller)
+    cid, page = connect()
+    page.client.send({'kind': 'start'})
+    page.json('mode', pump=service.poll)
+
+    t0 = time.monotonic()
+    page.client.send({'kind': 'preview'})
+    assert wait_for(lambda: service.poll() or source.waiting.is_set(), timeout=2.0)
+    page.client.send({'kind': 'ping', 'id': 9})
+    assert page.json('pong', pump=service.poll, timeout=2.0)['id'] == 9
+    page.client.send({'kind': 'preview'})
+    busy = page.json('error', pump=service.poll, timeout=2.0)
+    assert (busy['command'], busy['message']) == ('preview', controller_mod.MSG_PREVIEW_BUSY)
+    page.client.send({'kind': 'done'})
+    assert page.json('ended', pump=service.poll, timeout=2.0)['reason'] == 'done'
+    assert time.monotonic() - t0 < 2.0
+
+    for _ in range(10):
+        service.poll()
+    late = [m[1] for m in page.drain() if m[0] == 'json']
+    assert not [m for m in late if m.get('kind') == 'preview' or m.get('command') == 'preview']
+    assert not [t for t in threading.enumerate() if t.name == 'focus-preview']
