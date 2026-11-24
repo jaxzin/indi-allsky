@@ -208,12 +208,21 @@
             // and the slider then falls back to the defaults below)
             return {min: min, max: max, step: 1, fixed: true};
         }
-        var lo = known(min) ? min : 0;
-        var hi = known(max) && max > lo ? max : Math.max(600, Math.ceil(current * 2), lo + 1);
-        lo = Math.min(lo, current);
-        hi = Math.max(hi, current);
+        // a camera limit is a hard edge (set_camera refuses beyond it); only an unknown end stretches to take in
+        // the current gain
+        var lo = known(min) ? min : Math.min(0, current);
+        var hi = known(max) && max > lo ? max : Math.max(600, Math.ceil(current * 2), lo + 1, current);
         var span = hi - lo;
         return {min: lo, max: hi, step: span < 50 ? span / 100 : 1};
+    }
+
+    // The gain to put on the slider and send: inside the span, so a configured gain the camera cannot take is never
+    // sent back untouched; a fixed gain is the camera's one value.
+    function clampGain(span, g) {
+        if (span.fixed) {
+            return span.min;
+        }
+        return Math.min(span.max, Math.max(span.min, g));
     }
 
     // How long to expect between pictures. Before two have arrived there is no measured gap, and a still picture
@@ -263,7 +272,7 @@
         statusState: statusState, endedText: endedText, nearestRing: nearestRing, nextCmdId: nextCmdId,
         fmtAge: fmtAge, fmtExposure: fmtExposure, fmtGain: fmtGain, liveText: liveText,
         pendingAdd: pendingAdd, pendingShown: pendingShown, pendingDrop: pendingDrop, pendingRefused: pendingRefused,
-        exposureChoices: exposureChoices, gainRange: gainRange, expectedGap: expectedGap, regionBox: regionBox,
+        exposureChoices: exposureChoices, gainRange: gainRange, clampGain: clampGain, expectedGap: expectedGap, regionBox: regionBox,
         starWord: starWord, canMoveRegion: canMoveRegion
     };
     if (typeof module !== 'undefined' && module.exports) {
@@ -950,7 +959,7 @@
         g.min = gainSpan.min;
         g.max = gainSpan.max;
         g.step = gainSpan.step;
-        g.value = gain;
+        g.value = clampGain(gainSpan, gain);
         g.disabled = !!gainSpan.fixed;  // a fixed-gain camera: the value shows, nothing to slide
         g.title = gainSpan.fixed ? 'This camera has a fixed gain.' : '';
         camTouched = {exp: false, gain: false};
@@ -959,12 +968,12 @@
 
     function chosenGain() {
         if (!camTouched.gain || gainSpan.fixed) {
-            return S.mode.gain;
+            return clampGain(gainSpan, S.mode.gain);
         }
         var v = Number($id('fs-gain').value);
         // whole numbers on a wide range; two decimals on a narrow one (step = range / 100)
         v = gainSpan.step >= 1 ? Math.round(v) : Math.round(v * 100) / 100;
-        return Math.min(gainSpan.max, Math.max(gainSpan.min, v));
+        return clampGain(gainSpan, v);
     }
 
     function showCamera() {

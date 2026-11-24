@@ -160,6 +160,14 @@ def test_gain_range_for_a_fixed_gain_camera_is_fixed():
     assert got[2:] == [None, None]
 
 
+def test_gain_sent_stays_inside_the_camera_limits():
+    got = run('const g = (lo, hi, cur, v) => h.clampGain(h.gainRange(lo, hi, cur), v);'
+              ' console.log(JSON.stringify([g(1, 1, 100, 100), g(0, 300, 500, 500), g(0, 300, 500, 120),'
+              ' g(null, null, 100, 100), g(null, null, 700, 700), h.gainRange(0, 300, 500).max]));')
+
+    assert got == [1, 300, 120, 100, 700, 300]
+
+
 def test_region_can_move_in_both_modes_even_without_a_region_yet():
     got = run('console.log(JSON.stringify([h.canMoveRegion({picture: "stills", roi: null}),'
               ' h.canMoveRegion({picture: "video", roi: [0, 0, 1024, 1024]}),'
