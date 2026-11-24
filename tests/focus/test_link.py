@@ -1,0 +1,393 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import socket
+import stat
+import struct
+import tempfile
+import threading
+import time
+
+import pytest
+
+from indi_allsky.focus import link
+from indi_allsky.focus.link import LinkClient
+from indi_allsky.focus.link import LinkInUse
+from indi_allsky.focus.link import LinkServer
+from indi_allsky.focus.link import LinkUnavailable
+from indi_allsky.focus.link import NewestSlot
+from indi_allsky.focus.link import SlotOverflow
+from indi_allsky.focus.link import probe
+from indi_allsky.focus.session import MAX_PAGES
+
+
+REFUSAL = {'kind': 'refused', 'reason': 'Three pages are already watching this focus session.'}
+
+
+def wait_for(cond, timeout=2.0):
+    """Poll cond() until it is truthy or the timeout passes. Returns the last value."""
+    deadline = time.monotonic() + timeout
+    while True:
+        value = cond()
+        if value or time.monotonic() >= deadline:
+            return value
+        time.sleep(0.01)
+
+
+@pytest.fixture
+def sock_path():
+    # macOS caps AF_UNIX paths at 104 bytes and pytest's tmp_path is often longer.
+    d = tempfile.mkdtemp(prefix='iaf', dir='/tmp')
+    try:
+        yield os.path.join(d, 'focus.sock')
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@pytest.fixture
+def closers():
+    items = []
+    yield items
+    for item in reversed(items):
+        try:
+            item.close()
+        except Exception:
+            pass
+
+
+def make_server(sock_path, closers, **kwargs):
+    server = LinkServer(sock_path, **kwargs)
+    closers.append(server)
+    server.start()
+    return server
+
+
+def make_client(sock_path, closers):
+    client = LinkClient(sock_path)
+    closers.append(client)
+    client.connect()
+    return client
+
+
+def raw_connect(path):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(2.0)
+    s.connect(path)
+    return s
+
+
+def recv_until(client, want, timeout=2.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        msg = client.recv(0.1)
+        if msg is not None and want(msg):
+            return msg
+    return None
+
+
+def test_round_trip_json_and_frame(sock_path, closers):
+    server = make_server(sock_path, closers)
+    client = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    cid = server.clients()[0]
+
+    client.send({'cmd': 'hello', 'n': 1})
+    cmds = []
+    wait_for(lambda: cmds.extend(server.poll_commands()) or cmds)
+    assert cmds == [(cid, {'cmd': 'hello', 'n': 1})]
+    assert server.poll_commands() == []
+
+    server.broadcast_frame(b'\x00\x01frame-bytes')
+    assert client.recv(2.0) == ('frame', b'\x00\x01frame-bytes')
+
+    server.broadcast_json({'kind': 'status', 'v': 2})
+    assert client.recv(2.0) == ('json', {'kind': 'status', 'v': 2})
+
+    server.send_json(cid, {'kind': 'only-you'})
+    assert client.recv(2.0) == ('json', {'kind': 'only-you'})
+
+    assert client.recv(0.05) is None
+
+
+def test_recv_keeps_partial_message_across_timeout(sock_path, closers):
+    # A raw server so the test controls the byte boundaries.
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    closers.append(listener)
+    listener.bind(sock_path)
+    listener.listen(1)
+    client = make_client(sock_path, closers)
+    conn, _ = listener.accept()
+    closers.append(conn)
+
+    payload = json.dumps({'kind': 'x'}).encode()
+    data = b'J' + struct.pack('>I', len(payload)) + payload
+    conn.sendall(data[:3])
+    assert client.recv(0.1) is None
+    conn.sendall(data[3:])
+    assert client.recv(2.0) == ('json', {'kind': 'x'})
+
+
+@pytest.mark.parametrize('header', [
+    pytest.param(b'J' + struct.pack('>I', 64 * 1024 * 1024 + 1), id='oversize'),
+    pytest.param(b'Q' + struct.pack('>I', 2), id='unknown-kind'),
+])
+def test_client_rejects_malformed_server_message(sock_path, closers, header):
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    closers.append(listener)
+    listener.bind(sock_path)
+    listener.listen(1)
+    client = make_client(sock_path, closers)
+    conn, _ = listener.accept()
+    closers.append(conn)
+    conn.sendall(header)
+    with pytest.raises(LinkUnavailable) as exc:
+        client.recv(2.0)
+    assert exc.value.reason == 'protocol'
+
+
+def test_socket_mode_is_0600(sock_path, closers):
+    make_server(sock_path, closers)
+    mode = os.stat(sock_path).st_mode
+    assert stat.S_ISSOCK(mode)
+    assert stat.S_IMODE(mode) == 0o600
+
+
+def test_bind_replaces_stale_socket(sock_path, closers):
+    with open(sock_path, 'w') as f:
+        f.write('stale')
+    server = make_server(sock_path, closers)
+    assert stat.S_ISSOCK(os.stat(sock_path).st_mode)
+    make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+
+
+def test_bind_replaces_dead_socket_file(sock_path, closers):
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dead.bind(sock_path)
+    dead.close()  # the file stays; nobody answers on it
+    assert os.path.exists(sock_path)
+    server = make_server(sock_path, closers)
+    make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+
+
+def test_bind_refuses_directory(sock_path, closers):
+    os.mkdir(sock_path)
+    server = LinkServer(sock_path)
+    closers.append(server)
+    with pytest.raises(OSError):
+        server.start()
+    assert os.path.isdir(sock_path)
+
+
+def test_bind_refuses_live_socket(sock_path, closers):
+    first = make_server(sock_path, closers)
+    second = LinkServer(sock_path)
+    closers.append(second)
+    with pytest.raises(LinkInUse):
+        second.start()
+    # A failed start owns nothing, so closing it must not remove the first server's socket.
+    second.close()
+    assert probe(sock_path)
+    make_client(sock_path, closers)
+    assert wait_for(lambda: len(first.clients()) == 1)
+
+
+def test_newest_only_slot_drops_old_frames_keeps_json():
+    slot = NewestSlot()
+    slot.put_frame(b'frame1')
+    slot.put_json({'a': 1})
+    slot.put_frame(b'frame2')
+    slot.put_frame(b'frame3')
+    assert slot.get(0.1) == ('json', {'a': 1})
+    assert slot.get(0.1) == ('frame', b'frame3')
+    assert slot.get(0.05) is None
+
+
+def test_slot_keeps_json_after_frame_in_order():
+    slot = NewestSlot()
+    slot.put_json({'a': 1})
+    slot.put_frame(b'f')
+    slot.put_json({'b': 2})
+    assert slot.get(0.1) == ('json', {'a': 1})
+    assert slot.get(0.1) == ('frame', b'f')
+    assert slot.get(0.1) == ('json', {'b': 2})
+
+
+def test_slot_json_cap():
+    slot = NewestSlot(json_cap=256)
+    for i in range(256):
+        slot.put_json({'i': i})
+    slot.put_frame(b'frames do not count')
+    with pytest.raises(SlotOverflow):
+        slot.put_json({'i': 256})
+
+
+def test_fourth_client_refused(sock_path, closers):
+    assert MAX_PAGES == 3
+    server = make_server(sock_path, closers)
+    for _ in range(MAX_PAGES):
+        make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == MAX_PAGES)
+    ids = server.clients()
+
+    fourth = make_client(sock_path, closers)
+    assert fourth.recv(2.0) == ('json', REFUSAL)
+    with pytest.raises(LinkUnavailable) as exc:
+        fourth.recv(2.0)
+    assert exc.value.reason == 'closed'
+    assert server.clients() == ids
+
+
+def test_client_ids_increase_and_are_not_reused(sock_path, closers):
+    server = make_server(sock_path, closers)
+    a = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    first_id = server.clients()[0]
+    a.close()
+    assert wait_for(lambda: server.clients() == [])
+    make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    assert server.clients()[0] > first_id
+
+
+def test_probe_false_when_no_server(sock_path):
+    assert probe(sock_path) is False
+    with open(sock_path, 'w') as f:
+        f.write('not a socket')
+    assert probe(sock_path) is False
+
+
+def test_probe_true_when_server(sock_path, closers):
+    make_server(sock_path, closers)
+    assert probe(sock_path) is True
+
+
+def test_connect_unavailable_when_no_server(sock_path):
+    client = LinkClient(sock_path)
+    with pytest.raises(LinkUnavailable):
+        client.connect()
+
+
+def test_client_disconnect_does_not_break_server(sock_path, closers):
+    server = make_server(sock_path, closers)
+    a = make_client(sock_path, closers)
+    b = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 2)
+
+    a.close()
+    assert wait_for(lambda: len(server.clients()) == 1)
+
+    server.broadcast_json({'kind': 'still-here'})
+    assert b.recv(2.0) == ('json', {'kind': 'still-here'})
+
+    c = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 2)
+    server.broadcast_frame(b'f')
+    assert b.recv(2.0) == ('frame', b'f')
+    assert c.recv(2.0) == ('frame', b'f')
+
+
+@pytest.mark.parametrize('bad', [
+    pytest.param(b'J' + struct.pack('>I', 64 * 1024 + 1), id='oversize-json'),
+    pytest.param(b'Q' + struct.pack('>I', 2) + b'{}', id='unknown-kind'),
+    pytest.param(b'F' + struct.pack('>I', 2) + b'ab', id='frame-from-client'),
+    pytest.param(b'J' + struct.pack('>I', 5) + b'nope!', id='bad-json'),
+    pytest.param(b'J' + struct.pack('>I', 2) + b'[]', id='json-not-object'),
+])
+def test_malformed_client_is_dropped(sock_path, closers, bad):
+    server = make_server(sock_path, closers)
+    good = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+
+    raw = raw_connect(sock_path)
+    closers.append(raw)
+    assert wait_for(lambda: len(server.clients()) == 2)
+    raw.sendall(bad)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    assert server.poll_commands() == []
+
+    server.broadcast_json({'kind': 'ok'})
+    assert good.recv(2.0) == ('json', {'kind': 'ok'})
+
+
+def test_stalled_client_dropped_at_json_cap(sock_path, closers):
+    server = make_server(sock_path, closers)
+    reader = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    reader_id = server.clients()[0]
+
+    stalled = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    closers.append(stalled)
+    stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+    stalled.connect(sock_path)
+    assert wait_for(lambda: len(server.clients()) == 2)
+    stalled_id = [c for c in server.clients() if c != reader_id][0]
+
+    # Lockstep: the reading client drains each message before the next is sent, so only
+    # the stalled client's slot fills. Kernel buffers absorb some messages first, so the
+    # drop comes at 256 queued plus whatever the buffers held.
+    pad = 'x' * 4096
+    sent = 0
+    for i in range(3000):
+        server.broadcast_json({'kind': 'tick', 'i': i, 'pad': pad})
+        sent += 1
+        assert reader.recv(2.0) == ('json', {'kind': 'tick', 'i': i, 'pad': pad})
+        if stalled_id not in server.clients():
+            break
+
+    assert server.clients() == [reader_id]
+    assert sent > 256
+    server.broadcast_json({'kind': 'after'})
+    assert reader.recv(2.0) == ('json', {'kind': 'after'})
+
+
+def test_stalled_client_dropped_at_send_timeout(sock_path, closers, monkeypatch):
+    # Frames never overflow the slot, so the send timeout is a frame-only page's guard.
+    monkeypatch.setattr(link, 'SEND_TIMEOUT_S', 0.3)  # read at accept time
+    server = make_server(sock_path, closers)
+    reader = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    reader_id = server.clients()[0]
+
+    stalled = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    closers.append(stalled)
+    stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
+    stalled.connect(sock_path)
+    assert wait_for(lambda: len(server.clients()) == 2)
+
+    frame = b'\x7f' * (8 * 1024 * 1024)
+    server.broadcast_frame(frame)
+    assert reader.recv(3.0) == ('frame', frame)
+    assert wait_for(lambda: server.clients() == [reader_id], timeout=3.0)
+
+
+def test_close_removes_socket_and_disconnects_clients(sock_path, closers):
+    server = make_server(sock_path, closers)
+    client = make_client(sock_path, closers)
+    assert wait_for(lambda: len(server.clients()) == 1)
+    t0 = time.monotonic()
+    server.close()
+    assert time.monotonic() - t0 < 3.0
+    assert not os.path.exists(sock_path)
+    with pytest.raises(LinkUnavailable) as exc:
+        client.recv(2.0)
+    assert exc.value.reason == 'closed'
+    assert wait_for(lambda: not [t for t in threading.enumerate() if t.name.startswith('focus-link-')])
+    server.close()  # idempotent
+
+
+def test_close_leaves_socket_that_is_not_ours(sock_path, closers):
+    server = make_server(sock_path, closers)
+    os.unlink(sock_path)
+    other = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    closers.append(other)
+    other.bind(sock_path)
+    server.close()
+    assert os.path.exists(sock_path)
+
+
+def test_close_without_start_is_safe(sock_path):
+    LinkServer(sock_path).close()
