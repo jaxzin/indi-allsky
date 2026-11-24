@@ -40,6 +40,7 @@ def page(flask_app, sock_path, closers, monkeypatch):
         self.camera = _Camera()
 
     monkeypatch.setattr(base_views.TemplateView, '__init__', init)
+
     def base_context(self):
         return {
             'website_title': 'test', 'page_title': self.page_title, 'camera_id': self.camera.id,
@@ -145,6 +146,63 @@ def test_idle_page_keeps_todays_picture_and_score(page):
     status, html = page.get()
 
     assert 'data-focus-session' in html
-    assert '/indi-allsky/js/focus' in html
+    assert 'data-poll-url="/indi-allsky/js/focus"' in html  # focus_session.js polls it while idle
     assert 'id="image-canvas"' in html
-    assert 'blur_score' in html
+    assert 'id="focus-score"' in html
+    assert 'id="REFRESH_SELECT"' in html
+    assert 'id="ZOOM_SELECT"' in html
+
+
+def test_new_page_has_the_live_view_and_its_script(page):
+    page.link_up()
+    page.config['FOCUSER'] = {'CLASSNAME': 'focuser_x'}
+
+    status, html = page.get()
+
+    assert status == 200
+    for element in ('fs-idle', 'fs-live', 'fs-canvas', 'fs-rings', 'fs-age', 'fs-stxt', 'fs-value', 'fs-sub',
+                    'fs-pick', 'fs-stars-pop', 'fs-snr', 'fs-exp', 'fs-gain', 'fs-apply', 'fs-region-btn',
+                    'fs-region', 'fs-warn', 'fs-keep-going', 'fs-done', 'focus-start', 'FOCUS_CCW', 'FOCUS_CW',
+                    'STEP_DEGREES', 'fs-toast', 'fs-ended'):
+        assert 'id="{0:s}"'.format(element) in html, element
+    assert 'data-motor-url="/indi-allsky/ajax/focuscontroller"' in html  # the same POST as today's page
+    assert 'js/focus_session.js' in html
+    assert 'id="fs-trace"' not in html  # the trace is for hand-turned rigs
+    assert 'Start focusing' in html
+    assert 'Normal pictures pause while you focus.' in html
+
+
+def test_new_page_without_motor_has_the_trace(page):
+    page.link_up()
+
+    status, html = page.get()
+
+    assert 'id="fs-trace"' in html
+    assert 'id="FOCUS_CCW"' not in html
+
+
+def test_watchers_get_no_controls(page):
+    page.link_up()
+    page.config['FOCUSER'] = {'CLASSNAME': 'focuser_x'}
+
+    for remote_addr, admin in ((OUTSIDE_IP, True), (ADMIN_IP, False)):
+        status, html = page.get(remote_addr=remote_addr, admin=admin)
+
+        assert status == 200
+        assert 'No focus session is running. An admin can start one.' in html
+        for element in ('focus-start', 'fs-done', 'fs-pick', 'fs-keep-going', 'fs-apply', 'fs-region',
+                        'FOCUS_CCW', 'FOCUS_CW'):
+            assert 'id="{0:s}"'.format(element) not in html, element
+        assert 'js/focus_session.js' in html  # they still watch
+
+
+def test_stills_rig_shows_the_reason(page):
+    page.link_up()
+    page.config['CAMERA_INTERFACE'] = 'mqtt_imx477'
+
+    status, html = page.get()
+
+    assert status == 200
+    assert 'data-focus-session' in html
+    assert 'data-picture="stills"' in html
+    assert 'live video is not available for this camera type' in html
